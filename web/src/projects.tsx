@@ -331,6 +331,7 @@ export function ProjectPage({
             <h2>Recent runs</h2>
             <RunTable
               runs={runs.filter((run) => run.projectId === project?.id)}
+              projects={project ? [project] : []}
             />
           </section>
         </div>
