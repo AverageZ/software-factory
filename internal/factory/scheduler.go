@@ -140,7 +140,35 @@ func (e *Engine) pumpLocked() (bool, error) {
 				x.Error = "Decision nodes are unavailable: no decision provider is configured. No branch was selected."
 				addEvent(&r.Run, n.ID, "unavailable", x.Error)
 			case "branch":
-				selected := equalJSON(inputs[configString(n, "input")].Value, n.Config["equals"])
+				var selected bool
+				if conditions, exists := n.Config["conditions"]; exists {
+					_, hasInput := n.Config["input"]
+					_, hasEquals := n.Config["equals"]
+					if hasInput || hasEquals {
+						x.Status = "failed"
+						x.Error = "Invalid branch configuration: conditions cannot be mixed with input/equals."
+						addEvent(&r.Run, n.ID, "failed", x.Error)
+						break
+					}
+					if err := validateBranchConditions(conditions, n.Inputs); err != nil {
+						x.Status = "failed"
+						x.Error = fmt.Sprintf("Invalid branch conditions: %v", err)
+						addEvent(&r.Run, n.ID, "failed", x.Error)
+						break
+					}
+					selected = evaluateBranchConditions(conditions.(map[string]any), inputs)
+				} else {
+					input := configString(n, "input")
+					value, ok := inputs[input]
+					_, hasEquals := n.Config["equals"]
+					if !ok || !hasEquals {
+						x.Status = "failed"
+						x.Error = "Invalid legacy branch configuration."
+						addEvent(&r.Run, n.ID, "failed", x.Error)
+						break
+					}
+					selected = equalJSON(value.Value, n.Config["equals"])
+				}
 				x.Status = "succeeded"
 				x.Outputs = map[string]Value{"result": {Type: "boolean", Value: selected}}
 				addEvent(&r.Run, n.ID, "succeeded", fmt.Sprintf("Branch selected %t.", selected))

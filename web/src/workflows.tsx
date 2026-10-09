@@ -19,6 +19,7 @@ import "@xyflow/react/dist/style.css";
 import { errorMessage, href, json, parseObject, post, request } from "./api";
 import { ErrorNotice, JsonField, PageHeader } from "./components";
 import { nodeKinds, valueTypes } from "./types";
+import { RecipeEditor, recipeFromWorkflow } from "./recipes";
 import type { Input, Layout, NodeKind, Workflow, WorkflowNode } from "./types";
 
 type EditorNode = FlowNode<
@@ -40,7 +41,7 @@ const kindDescriptions: Record<NodeKind, string> = {
   validation:
     "Runs a validation argv array in a mapped repository. A nonzero exit fails the node.",
   branch:
-    "Compares one named resolved input to a JSON value. Label outgoing edges true or false.",
+    "Routes on a resolved input comparison or a nested ALL / ANY condition group. Label outgoing edges true or false.",
   parallel:
     "Explicit fan-out/barrier. All predecessors must complete; project maxParallel limits concurrency.",
   workflow:
@@ -58,7 +59,7 @@ const configHelp: Record<NodeKind, string> = {
   approval: "message (string) shown to the person reviewing this approval.",
   validation:
     "command (argv string array), timeoutSeconds (optional number), artifacts (optional repository-relative paths).",
-  branch: "input (the name of a node input), equals (any JSON value).",
+  branch: 'Legacy: input and equals. Recipe: conditions with combinator "all"/"any" and nested rules with input, optional property, operator (equals, notEquals, exists, notExists), and value for comparisons.',
   parallel: "No configuration required: {}.",
   workflow:
     "workflowId (the saved child workflow ID). Recursive definitions are rejected.",
@@ -116,7 +117,7 @@ export function WorkflowList({ workflows }: { workflows: Workflow[] }) {
     <>
       <PageHeader
         title="Reusable workflows"
-        description="Typed execution graphs, independent of project repository paths. Positions are stored separately from workflow logic."
+        description="Create a Given/When/Then recipe with nested conditions and ordered actions, or edit an advanced execution graph. Both save runnable workflow definitions."
       >
         <a className="button primary" href={href("workflows", "new")}>
           New workflow
@@ -147,8 +148,9 @@ export function WorkflowList({ workflows }: { workflows: Workflow[] }) {
         <section className="panel empty">
           <h2>No workflows yet</h2>
           <p>
-            Create nodes on a graph, connect dependencies, then bind repository
-            slots to a project.
+            Start with a run-start recipe: declare inputs, add ALL / ANY
+            conditions, and order actions. Use the graph editor for advanced
+            dependencies.
           </p>
           <a className="button" href={href("workflows", "new")}>
             Create workflow
@@ -168,6 +170,9 @@ export function WorkflowPage({
   workflows: Workflow[];
   onSaved: (workflow: Workflow) => void;
 }) {
+  const [editor, setEditor] = useState<"recipe" | "graph">(
+    !workflow || recipeFromWorkflow(workflow) ? "recipe" : "graph",
+  );
   const [layout, setLayout] = useState<Layout | null>(
     workflow ? null : { nodes: {} },
   );
@@ -187,6 +192,15 @@ export function WorkflowPage({
       });
     return () => controller.abort();
   }, [id, reload]);
+  if (editor === "recipe")
+    return (
+      <RecipeEditor
+        workflow={workflow}
+        workflows={workflows}
+        onSaved={onSaved}
+        onGraph={() => setEditor("graph")}
+      />
+    );
   if (!layout)
     return (
       <>
@@ -202,12 +216,19 @@ export function WorkflowPage({
       </>
     );
   return (
-    <WorkflowEditor
-      workflow={workflow}
-      workflows={workflows}
-      layout={layout}
-      onSaved={onSaved}
-    />
+    <>
+      {(!workflow || recipeFromWorkflow(workflow)) && (
+        <div className="actions">
+          <button onClick={() => setEditor("recipe")}>Recipe editor</button>
+        </div>
+      )}
+      <WorkflowEditor
+        workflow={workflow}
+        workflows={workflows}
+        layout={layout}
+        onSaved={onSaved}
+      />
+    </>
   );
 }
 

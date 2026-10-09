@@ -108,6 +108,140 @@ func configString(n WorkflowNode, key string) string {
 	value, _ := n.Config[key].(string)
 	return value
 }
+
+// Condition trees have a finite maximum size even when supplied by a client.
+const maxConditionDepth = 8
+const maxConditionRules = 256
+
+func validateBranchConditions(value any, inputs map[string]Input) error {
+	count := 0
+	var group func(any, int) error
+	group = func(value any, depth int) error {
+		if depth > maxConditionDepth {
+			return fmt.Errorf("branch conditions exceed maximum nesting depth")
+		}
+		fields, ok := value.(map[string]any)
+		if !ok || len(fields) != 2 {
+			return fmt.Errorf("branch conditions group must have combinator and rules")
+		}
+		combinator, ok := fields["combinator"].(string)
+		if !ok || combinator != "all" && combinator != "any" {
+			return fmt.Errorf("branch conditions combinator must be all or any")
+		}
+		rules, ok := fields["rules"].([]any)
+		if !ok || len(rules) == 0 {
+			return fmt.Errorf("branch conditions rules must be a nonempty array")
+		}
+		for _, item := range rules {
+			count++
+			if count > maxConditionRules {
+				return fmt.Errorf("branch conditions exceed maximum rule count")
+			}
+			rule, ok := item.(map[string]any)
+			if !ok {
+				return fmt.Errorf("branch condition rule must be an object")
+			}
+			if _, nested := rule["rules"]; nested {
+				if err := group(item, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+			input, ok := rule["input"].(string)
+			if !ok || input == "" {
+				return fmt.Errorf("branch condition must name an input")
+			}
+			if _, ok := inputs[input]; !ok {
+				return fmt.Errorf("branch condition references unknown input %q", input)
+			}
+			if property, exists := rule["property"]; exists {
+				path, ok := property.(string)
+				if !ok || path == "" {
+					return fmt.Errorf("branch condition property must be a dotted path")
+				}
+				for _, part := range strings.Split(path, ".") {
+					if part == "" {
+						return fmt.Errorf("branch condition property must be a dotted path")
+					}
+				}
+			}
+			operator, ok := rule["operator"].(string)
+			if !ok {
+				return fmt.Errorf("branch condition requires an operator")
+			}
+			_, hasValue := rule["value"]
+			switch operator {
+			case "equals", "notEquals":
+				if !hasValue {
+					return fmt.Errorf("branch condition %s requires value", operator)
+				}
+			case "exists", "notExists":
+				if hasValue {
+					return fmt.Errorf("branch condition %s cannot specify value", operator)
+				}
+			default:
+				return fmt.Errorf("branch condition has unknown operator %q", operator)
+			}
+			expected := 2
+			if _, exists := rule["property"]; exists {
+				expected++
+			}
+			if hasValue {
+				expected++
+			}
+			if len(rule) != expected {
+				return fmt.Errorf("branch condition has unknown fields")
+			}
+		}
+		return nil
+	}
+	return group(value, 1)
+}
+
+// evaluateBranchConditions is called only after validating the snapshot.
+func evaluateBranchConditions(group map[string]any, inputs map[string]Value) bool {
+	all := group["combinator"] == "all"
+	for _, item := range group["rules"].([]any) {
+		rule := item.(map[string]any)
+		matched := false
+		if _, nested := rule["rules"]; nested {
+			matched = evaluateBranchConditions(rule, inputs)
+		} else {
+			value, present := inputs[rule["input"].(string)]
+			actual := value.Value
+			if path, hasPath := rule["property"].(string); hasPath {
+				for _, part := range strings.Split(path, ".") {
+					object, ok := actual.(map[string]any)
+					if !ok {
+						present = false
+						break
+					}
+					actual, present = object[part]
+					if !present {
+						break
+					}
+				}
+			}
+			switch rule["operator"] {
+			case "exists":
+				matched = present && actual != nil
+			case "notExists":
+				matched = !present || actual == nil
+			case "equals":
+				matched = present && equalJSON(actual, rule["value"])
+			case "notEquals":
+				matched = present && !equalJSON(actual, rule["value"])
+			}
+		}
+		if all && !matched {
+			return false
+		}
+		if !all && matched {
+			return true
+		}
+	}
+	return all
+}
 func commandArgs(n WorkflowNode) ([]string, error) {
 	items, ok := n.Config["command"].([]any)
 	if !ok || len(items) == 0 {
@@ -221,11 +355,23 @@ func validateWorkflow(w Workflow, definitions map[string]Workflow) error {
 				return fmt.Errorf("approval %s requires a message", n.ID)
 			}
 		case "branch":
-			if _, ok := n.Inputs[configString(n, "input")]; !ok {
-				return fmt.Errorf("branch %s must name one of its inputs", n.ID)
-			}
-			if _, exists := n.Config["equals"]; !exists {
-				return fmt.Errorf("branch %s requires equals", n.ID)
+			if conditions, exists := n.Config["conditions"]; exists {
+				if _, legacy := n.Config["input"]; legacy {
+					return fmt.Errorf("branch %s cannot mix conditions with legacy input/equals", n.ID)
+				}
+				if _, legacy := n.Config["equals"]; legacy {
+					return fmt.Errorf("branch %s cannot mix conditions with legacy input/equals", n.ID)
+				}
+				if err := validateBranchConditions(conditions, n.Inputs); err != nil {
+					return fmt.Errorf("branch %s: %w", n.ID, err)
+				}
+			} else {
+				if _, ok := n.Inputs[configString(n, "input")]; !ok {
+					return fmt.Errorf("branch %s must name one of its inputs", n.ID)
+				}
+				if _, exists := n.Config["equals"]; !exists {
+					return fmt.Errorf("branch %s requires equals", n.ID)
+				}
 			}
 		case "workflow":
 			child, exists := definitions[configString(n, "workflowId")]

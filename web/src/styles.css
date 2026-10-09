@@ -701,6 +701,46 @@ td:first-child {
   max-width: 340px;
   margin-bottom: 20px;
 }
+.recipe-editor {
+  display: grid;
+  gap: 18px;
+}
+.recipe-editor .panel {
+  margin: 0;
+}
+.recipe-editor .field {
+  max-width: 720px;
+}
+.recipe-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.recipe-row input,
+.recipe-row select {
+  flex: 1 1 145px;
+  min-width: 110px;
+  max-width: 320px;
+}
+.condition-group {
+  border-left: 3px solid #c8d5e7;
+  padding: 8px 0 8px 16px;
+  display: grid;
+  gap: 12px;
+}
+.recipe-condition {
+  display: grid;
+  gap: 6px;
+}
+.recipe-action {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+  background: #f7f9fc;
+}
 .workflow-toolbar {
   display: flex;
   flex-wrap: wrap;

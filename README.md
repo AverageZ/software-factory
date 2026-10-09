@@ -58,7 +58,7 @@ Do not rebuild or restart the daemon while a managed job is active; shutdown int
 ## Configure and run
 
 1. Create a project; attach existing local Git roots. Configure the harness executable/model and project-wide parallelism.
-2. Create a reusable workflow in **Workflows**. Add/configure nodes, connect their handles, and save. Graph positions and viewport are saved separately from execution semantics.
+2. Create a reusable workflow in **Workflows**. New workflows open in the Given/When/Then recipe editor: declare typed run inputs, add nested **ALL / ANY** conditions, and order actions by dragging or using Up/Down. Saved recipes are execution graphs, not freeform English; existing complex graphs stay editable in the graph editor. Graph positions and viewport are saved separately from execution semantics.
 3. Add a project binding: map workflow repository slots to attached repositories and supply typed inputs.
 4. Start the binding. Observe real node outputs, events, logs, artifacts, child runs, and approval controls.
 
@@ -69,11 +69,13 @@ Factory controls execution, not repository skills, rules, or system prompts. Age
 | Agent | `prompt`; optional `timeoutSeconds`, `artifacts` |
 | Command / tool / validation | `command` argv array; optional `timeoutSeconds`, `artifacts` |
 | Approval | `message`; explicit approval continues, rejection fails |
-| Branch | `input` name and `equals` JSON value; outgoing edges labeled `true`/`false` |
+| Branch | Legacy: `input` name and `equals` JSON value. Recipes: `conditions` group (`combinator`: `all`/`any`, nonempty `rules`) containing nested groups or rules with `input`, optional dotted object `property`, `operator` (`equals`, `notEquals`, `exists`, `notExists`), and `value` for comparisons. Outgoing edges labeled `true`/`false` |
 | Parallel | Fan-out/barrier using graph edges; waits for every predecessor |
 | Nested workflow | `workflowId`; inherits repository mappings; node inputs become child inputs |
 | Integration | Real HTTP `url`; optional `method`, `headers`, JSON `body`, `timeoutSeconds`; non-2xx fails |
 | Decision | **Unavailable** until a decision provider is implemented; never fabricates a result |
+
+In a recipe, **WHEN** means a project binding is explicitly started; it does not subscribe to GitHub issues or change intake authorization. **GIVEN** evaluates the branch conditions against typed run inputs (a missing or null property satisfies `notExists`); false skips the action sequence. **THEN** actions execute in order, with each next action starting only after the previous one succeeds. Failed actions stop the run; explicit Retry remains subject to existing managed-workflow restrictions. The recipe editor does not express automatic failure handlers, waits, parallel fan-out, or arbitrary graph merges—use the graph editor where supported instead of assuming Gherkin text has execution semantics.
 
 Workflow inputs declare names and types. Node inputs contain `type` and either `value` or `from` (`inputs.NAME` or `ANCESTOR.result`). Command inputs are available as `FACTORY_INPUTS` JSON. Outputs use typed `result` envelopes: commands/agents expose `exitCode`, `stdout`, `stderr`; integrations expose `status`, `body`. Domain types such as `TestResult` and `ReviewFinding` label object payloads, not custom schema validation. Process output envelopes are capped at 64 KiB per stream; complete attempt logs remain available. Artifacts are repository-relative files copied into Factory storage.
 
