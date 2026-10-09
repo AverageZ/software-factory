@@ -45,7 +45,7 @@ func TestIssuePublicationStopsOnRevocationDuringBaseLookup(t *testing.T) {
 			node.Status = "succeeded"
 			run.Run.Nodes["implement"] = node
 			e.runs[run.Run.ID] = run
-			j := savedIssueJob{IssueJob: IssueJob{ID: "revoked", ProjectID: p.ID, RepositoryID: "repo", GitHubRepositoryID: 123, Number: 1, Title: "Repair", Status: "publishing", RunID: run.Run.ID}, Project: p, Repository: p.Repositories[0], Connection: connection, Body: "Fix it", BaseBranch: "main"}
+			j := savedIssueJob{IssueJob: IssueJob{ID: "revoked", ProjectID: p.ID, RepositoryID: "repo", GitHubRepositoryID: 123, Number: 1, Title: "Repair", Status: "publishing", RunID: run.Run.ID}, Project: p, Repository: p.Repositories[0], Connection: connection, Body: "Fix it", PRBody: sampleIssuePRBody, BaseBranch: "main"}
 			j.setWorkspace(w)
 			if err = e.store.save(record{"run", run.Run.ID, run}, record{"intake", githubKey(p.ID, "repo"), config}); err != nil {
 				t.Fatal(err)
