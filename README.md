@@ -16,7 +16,7 @@ Open **http://127.0.0.1:8080**. The daemon serves `web/dist` and `/api`, storing
 
 `make dev` starts the real daemon and Vite at port 5173. `FACTORY_DATA` overrides its data directory; `.env.example` is not automatically loaded. `make test` runs Go race tests and the frontend build; `make lint` checks formatting, Go vet, and TypeScript.
 
-The attached Strategy Game project and real verification runs are stored in `.factory-data/v2`. Use `.factory-data/bin/factoryd -data .factory-data/v2` to reopen them. Legacy `.factory-data` databases are untouched and are not imported into the new model.
+The attached Strategy Game project and real verification runs are stored in the local, ignored `.factory-data/v2` directory. Use `.factory-data/bin/factoryd -data .factory-data/v2` to reopen them. Legacy `.factory-data` databases are untouched and are not imported into the new model.
 
 ### Rebuild and restart the running daemon
 
@@ -35,6 +35,25 @@ Start the replacement **with the same data directory** as the previous daemon. F
 ```
 
 Wait for the `Factory listening` message. Leave that terminal open. In another terminal, run `curl -fsS http://127.0.0.1:8080/api/health`; `{"status":"ok"}` confirms it is serving. Reload the dashboard. To keep a daemon running after closing a terminal, use your process manager with the same executable, working directory, and arguments—not a second instance sharing `.factory-data/v2`. Omitting `-data .factory-data/v2` instead opens the unrelated default `~/.factory`.
+
+## Dogfood Factory on itself
+
+The local daemon at `.factory-data/v2` also has a **Software Factory** project attached to this repository (`factory-dogfood` / `factory-source`), with OMP model `openai-codex/gpt-6-sol` and project parallelism 1. Its `AverageZ/software-factory` GitHub connection is verified, Factory labels have been created, and issue intake is enabled. These settings live in ignored local daemon state; a fresh clone or data directory needs its own project, repository attachment, GitHub check, label setup, and intake enablement through the dashboard. Use the authenticated `gh` CLI and the repository's `origin` URL; do not copy `.factory-data/v2` between machines.
+
+For a concrete improvement, open an issue on `AverageZ/software-factory` with a bounded outcome, acceptance criteria, and verification steps. Add `agent:run` only when ready for the agent to work on it (optional `agent/workflow:bug` and `agent/mode:repair`). The daemon polls every 30 seconds; **Poll now** on the project page forces a scan. The built-in issue workflow executes OMP in an owned worktree, runs the requested checks, and publishes a **draft PR**. Read the run transcript and checks, inspect the diff, and review it yourself; the agent's report is not independent validation. Failed or interrupted jobs retain their worktree and require inspection, not automatic replay.
+
+To iterate on review feedback, add `agent:run` to the **Factory-owned PR** separately. Trusted collaborator feedback in conversation, inline comments, or reviews is then passed to the project's editable **PR feedback revision** workflow; the issue's label alone does not authorize PR changes. Remove the PR's `agent:run` to stop new revisions. Only a human should mark a draft ready and merge. Generic workflows started against the attached repository operate in this checkout, not an isolated worktree; use managed issue intake for code changes.
+
+Check the setup and run state with:
+
+```sh
+.factory-data/bin/factoryctl api GET /api/projects/factory-dogfood/repositories/factory-source/github
+.factory-data/bin/factoryctl api GET /api/projects/factory-dogfood/repositories/factory-source/intake
+.factory-data/bin/factoryctl api POST /api/projects/factory-dogfood/repositories/factory-source/intake/poll
+.factory-data/bin/factoryctl api GET /api/runs?projectId=factory-dogfood
+```
+
+Do not rebuild or restart the daemon while a managed job is active; shutdown interrupts its work. The daemon must keep running for automatic polls. The repository's `CLAUDE.md` holds Factory-specific agent conventions.
 
 ## Configure and run
 
