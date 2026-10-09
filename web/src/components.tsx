@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { json, timestamp } from "./api";
-import type { Run, Value } from "./types";
+import type { Project, Run, Value } from "./types";
 
 export function ErrorNotice({ message }: { message: string }) {
   return message ? (
@@ -62,7 +62,7 @@ export function JsonField({
   );
 }
 
-export function RunTable({ runs }: { runs: Run[] }) {
+export function RunTable({ runs, projects }: { runs: Run[]; projects: Project[] }) {
   if (!runs.length) return <p className="empty">No recorded runs.</p>;
   return (
     <div className="table-scroll">
@@ -70,6 +70,7 @@ export function RunTable({ runs }: { runs: Run[] }) {
         <thead>
           <tr>
             <th>Run</th>
+            <th>Project</th>
             <th>Status</th>
             <th>Started</th>
             <th>Updated</th>
@@ -87,6 +88,10 @@ export function RunTable({ runs }: { runs: Run[] }) {
                   {run.parentRunId && (
                     <span className="muted"> · child run</span>
                   )}
+                </td>
+                <td>
+                  {projects.find((project) => project.id === run.projectId)
+                    ?.name || run.projectId}
                 </td>
                 <td>
                   <Status status={run.status} />

@@ -62,6 +62,8 @@ Do not rebuild or restart the daemon while a managed job is active; shutdown int
 3. Add a project binding: map workflow repository slots to attached repositories and supply typed inputs.
 4. Start the binding. Observe real node outputs, events, logs, artifacts, child runs, and approval controls.
 
+The **Runs** list shows each run's project name alongside its ID, status, and timestamps (or the project ID if the project is no longer available). The same columns appear under **Recent runs** on a project page.
+
 Factory controls execution, not repository skills, rules, or system prompts. Agent nodes pass a workflow pre-prompt and typed input data to `omp -p` in the selected repository. Authentication, configuration, and repository discovery are inherited from your normal environment. Tool nodes call repository scripts; no Factory manifest is required inside a repository.
 
 | Node | Configuration |

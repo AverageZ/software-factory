@@ -44,6 +44,7 @@ export function RunsPage({
       <section className="panel">
         <RunTable
           runs={runs.filter((run) => !projectId || run.projectId === projectId)}
+          projects={projects}
         />
       </section>
     </>
