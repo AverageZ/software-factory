@@ -16,7 +16,7 @@ Open **http://127.0.0.1:8080**. The daemon serves `web/dist` and `/api`, storing
 
 `make dev` starts the real daemon and Vite at port 5173. `FACTORY_DATA` overrides its data directory; `.env.example` is not automatically loaded. `make test` runs Go race tests and the frontend build; `make lint` checks formatting, Go vet, and TypeScript.
 
-The attached Strategy Game project and real verification runs are stored in the local, ignored `.factory-data/v2` directory. Use `.factory-data/bin/factoryd -data .factory-data/v2` to reopen them. Legacy `.factory-data` databases are untouched and are not imported into the new model.
+The local Strategy Game and Software Factory projects, with their run histories, now live in `~/.factory`. An older snapshot remains in the ignored `.factory-data/v2` directory; **do not start a second daemon with that snapshot** while the migrated daemon is running.
 
 ### Rebuild and restart the running daemon
 
@@ -28,17 +28,17 @@ make build
 
 This replaces `.factory-data/bin/factoryd` and `.factory-data/bin/factoryctl` and rebuilds `web/dist`; it does **not** restart an already-running daemon. Stop the old process with **Ctrl-C** in its terminal. If it was started in the background, identify the process listening on port 8080 with `lsof -nP -iTCP:8080 -sTCP:LISTEN`, confirm its command is `factoryd`, then send that PID `kill -TERM PID` (replace `PID` with the number printed by `lsof`). Wait for it to exit before starting another instance; never use `kill -9` for a routine restart.
 
-Start the replacement **with the same data directory** as the previous daemon. For the checked-in Strategy Game setup:
+Start the replacement **with the same data directory** as the previous daemon. The migrated Strategy Game and self-hosted Software Factory projects use the default `~/.factory`:
 
 ```sh
-.factory-data/bin/factoryd -data .factory-data/v2 -web web/dist -addr 127.0.0.1:8080
+.factory-data/bin/factoryd -data "$HOME/.factory" -web web/dist -addr 127.0.0.1:8080
 ```
 
-Wait for the `Factory listening` message. Leave that terminal open. In another terminal, run `curl -fsS http://127.0.0.1:8080/api/health`; `{"status":"ok"}` confirms it is serving. Reload the dashboard. To keep a daemon running after closing a terminal, use your process manager with the same executable, working directory, and arguments—not a second instance sharing `.factory-data/v2`. Omitting `-data .factory-data/v2` instead opens the unrelated default `~/.factory`.
+Wait for the `Factory listening` message. Leave that terminal open. In another terminal, run `curl -fsS http://127.0.0.1:8080/api/health`; `{"status":"ok"}` confirms it is serving. Reload the dashboard. To keep a daemon running after closing a terminal, use your process manager with the same executable, working directory, and arguments—not a second instance sharing `~/.factory`. A different data directory is a different Factory installation and may try to process the same issues.
 
 ## Dogfood Factory on itself
 
-The local daemon at `.factory-data/v2` also has a **Software Factory** project attached to this repository (`factory-dogfood` / `factory-source`), with OMP model `openai-codex/gpt-6-sol` and project parallelism 1. Its `AverageZ/software-factory` GitHub connection is verified, Factory labels have been created, and issue intake is enabled. These settings live in ignored local daemon state; a fresh clone or data directory needs its own project, repository attachment, GitHub check, label setup, and intake enablement through the dashboard. Use the authenticated `gh` CLI and the repository's `origin` URL; do not copy `.factory-data/v2` between machines.
+The local daemon at `~/.factory` has a **Software Factory** project attached to this repository (`factory-dogfood` / `factory-source`), with OMP model `openai-codex/gpt-6-sol` and project parallelism 1. Its `AverageZ/software-factory` GitHub connection is verified, Factory labels have been created, and issue intake is enabled. These settings live in local daemon state; a fresh clone or data directory needs its own project, repository attachment, GitHub check, label setup, and intake enablement through the dashboard. Use the authenticated `gh` CLI and the repository's `origin` URL; do not copy local daemon state between machines. **For self-hosting, keep the data directory outside this Git checkout**: managed worktrees live beneath it, and Factory refuses to put a worktree inside another checkout of the same repository.
 
 For a concrete improvement, open an issue on `AverageZ/software-factory` with a bounded outcome, acceptance criteria, and verification steps. Add `agent:run` only when ready for the agent to work on it (optional `agent/workflow:bug` and `agent/mode:repair`). The daemon polls every 30 seconds; **Poll now** on the project page forces a scan. The built-in issue workflow executes OMP in an owned worktree, runs the requested checks, and publishes a **draft PR**. Read the run transcript and checks, inspect the diff, and review it yourself; the agent's report is not independent validation. Failed or interrupted jobs retain their worktree and require inspection, not automatic replay.
 
