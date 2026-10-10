@@ -3,6 +3,7 @@ package factory
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"os/exec"
 	"path/filepath"
@@ -171,9 +172,14 @@ func validateBranchConditions(value any, inputs map[string]Input) error {
 			}
 			_, hasValue := rule["value"]
 			switch operator {
-			case "equals", "notEquals":
+			case "equals", "notEquals", "contains", "notContains":
 				if !hasValue {
 					return fmt.Errorf("branch condition %s requires value", operator)
+				}
+			case "greaterThan", "greaterOrEqual", "lessThan", "lessOrEqual":
+				value, ok := rule["value"].(float64)
+				if !ok || math.IsNaN(value) || math.IsInf(value, 0) {
+					return fmt.Errorf("branch condition %s requires a finite JSON number value", operator)
 				}
 			case "exists", "notExists":
 				if hasValue {
@@ -231,6 +237,39 @@ func evaluateBranchConditions(group map[string]any, inputs map[string]Value) boo
 				matched = present && equalJSON(actual, rule["value"])
 			case "notEquals":
 				matched = present && !equalJSON(actual, rule["value"])
+			case "contains", "notContains":
+				contains, supported := false, false
+				switch collection := actual.(type) {
+				case []any:
+					supported = true
+					for _, member := range collection {
+						if equalJSON(member, rule["value"]) {
+							contains = true
+							break
+						}
+					}
+				case string:
+					if expected, ok := rule["value"].(string); ok {
+						supported = true
+						contains = strings.Contains(collection, expected)
+					}
+				}
+				matched = present && supported && (contains == (rule["operator"] == "contains"))
+			case "greaterThan", "greaterOrEqual", "lessThan", "lessOrEqual":
+				number, ok := actual.(float64)
+				expected, valid := rule["value"].(float64)
+				if present && ok && valid && !math.IsNaN(number) && !math.IsInf(number, 0) && !math.IsNaN(expected) && !math.IsInf(expected, 0) {
+					switch rule["operator"] {
+					case "greaterThan":
+						matched = number > expected
+					case "greaterOrEqual":
+						matched = number >= expected
+					case "lessThan":
+						matched = number < expected
+					case "lessOrEqual":
+						matched = number <= expected
+					}
+				}
 			}
 		}
 		if all && !matched {
@@ -331,6 +370,19 @@ func validateWorkflow(w Workflow, definitions map[string]Workflow) error {
 			if !ok || seconds <= 0 || seconds > 604800 {
 				return fmt.Errorf("node %s timeoutSeconds must be positive and at most 604800", n.ID)
 			}
+		}
+		if outputJSON, exists := n.Config["outputJson"]; exists {
+			if _, ok := outputJSON.(bool); !ok {
+				return fmt.Errorf("node %s outputJson must be a boolean", n.ID)
+			}
+			switch n.Kind {
+			case "agent", "command", "tool", "validation":
+			default:
+				return fmt.Errorf("node %s outputJson is only supported for process tasks", n.ID)
+			}
+		}
+		if err := validateAgentSettings(n); err != nil {
+			return err
 		}
 		switch n.Kind {
 		case "command", "tool", "validation":

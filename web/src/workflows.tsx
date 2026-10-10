@@ -19,7 +19,10 @@ import "@xyflow/react/dist/style.css";
 import { errorMessage, href, json, parseObject, post, request } from "./api";
 import { ErrorNotice, JsonField, PageHeader } from "./components";
 import { nodeKinds, valueTypes } from "./types";
-import { RecipeEditor, recipeFromWorkflow } from "./recipes";
+import { StageEditor } from "./workflowStageEditor";
+import { stagesFromWorkflow } from "./workflowStages";
+import { DeclarationEditor } from "./workflowDeclarationEditor";
+import { workflowActions } from "./declarative";
 import type { Input, Layout, NodeKind, Workflow, WorkflowNode } from "./types";
 
 type EditorNode = FlowNode<
@@ -30,41 +33,53 @@ type EditorEdge = FlowEdge<{ when?: "true" | "false" }>;
 
 const kindDescriptions: Record<NodeKind, string> = {
   agent:
-    "Runs the project harness in a mapped repository. Supply a workflow pre-prompt, not repository rules or system settings.",
-  tool: "Runs a real repository tool using an argv array. Typed inputs are exposed in FACTORY_INPUTS.",
+    "Runs the project's AI tool in the selected repository. Write task instructions. Do not put repository rules or system settings here.",
+  tool: "Runs a repository tool. Give the command and each argument as a separate string. Run inputs are available in FACTORY_INPUTS.",
   command:
-    "Runs an argv array in a mapped repository. No shell expansion unless you explicitly use a shell.",
+    "Runs a command in the selected repository. Give the command and each argument as a separate string. Shell expansion works only if you run a shell explicitly.",
   decision:
-    "Unavailable. No decision provider is configured; execution fails explicitly. Use branch for deterministic routing.",
+    "Unavailable. No decision provider is configured. This task fails if it runs. Use a branch to choose a path from values.",
   approval:
-    "Waits for an explicit approve or reject action. Rejection fails the run.",
+    "Waits for a person to approve or reject. Rejection fails the run.",
   validation:
-    "Runs a validation argv array in a mapped repository. A nonzero exit fails the node.",
+    "Runs a check command in the selected repository. A nonzero exit code fails the task.",
   branch:
-    "Routes on a resolved input comparison or a nested ALL / ANY condition group. Label outgoing edges true or false.",
+    "Checks a value or a group of conditions. Set each outgoing line to true or false.",
   parallel:
-    "Explicit fan-out/barrier. All predecessors must complete; project maxParallel limits concurrency.",
+    "Starts separate paths. Waits for all tasks connected before it. The project's maxParallel setting limits how many tasks can run at once.",
   workflow:
-    "Executes a real child workflow with inherited repository mappings. Node inputs become child workflow inputs.",
-  integration: "Makes a real HTTP request. Non-2xx responses fail the node.",
+    "Runs another saved workflow. Uses the same repository mappings. Task inputs become run inputs for that workflow.",
+  integration: "Sends an HTTP request. A response outside 200–299 fails the task.",
 };
 const configHelp: Record<NodeKind, string> = {
   agent:
-    "prompt (string), timeoutSeconds (optional number), artifacts (optional array of repository-relative paths).",
-  tool: "command (argv string array), timeoutSeconds (optional number), artifacts (optional repository-relative paths).",
+    "prompt: task instructions (string). Optional fields: outputJson (boolean; require a JSON object on standard output, available as result.data), timeoutSeconds (number), artifacts (array of paths relative to the repository).",
+  tool: 'command: an array of strings, with the program first and each argument separate, for example ["go","test","./..."]. Optional fields: outputJson (boolean; require a JSON object on standard output, available as result.data), timeoutSeconds (number), artifacts (array of paths relative to the repository).',
   command:
-    "command (argv string array), timeoutSeconds (optional number), artifacts (optional repository-relative paths).",
+    'command: an array of strings, with the program first and each argument separate, for example ["go","test","./..."]. Optional fields: outputJson (boolean; require a JSON object on standard output, available as result.data), timeoutSeconds (number), artifacts (array of paths relative to the repository).',
   decision:
-    "Not configurable for execution. This node remains visibly unavailable.",
-  approval: "message (string) shown to the person reviewing this approval.",
+    "This task is unavailable. Configuration cannot make it run.",
+  approval: "message: instructions for the person who reviews the result (string).",
   validation:
-    "command (argv string array), timeoutSeconds (optional number), artifacts (optional repository-relative paths).",
-  branch: 'Legacy: input and equals. Recipe: conditions with combinator "all"/"any" and nested rules with input, optional property, operator (equals, notEquals, exists, notExists), and value for comparisons.',
-  parallel: "No configuration required: {}.",
+    'command: an array of strings, with the program first and each argument separate, for example ["go","test","./..."]. Optional fields: outputJson (boolean; require a JSON object on standard output, available as result.data), timeoutSeconds (number), artifacts (array of paths relative to the repository).',
+  branch: 'For a single equality check, use input (input name) and equals (value to compare). For a group, use combinator "all" (every condition) or "any" (at least one condition), and rules (an array of conditions or nested groups). Each condition uses input, optional property (a field in the value), operator (equals, notEquals, exists, notExists, greaterThan, greaterOrEqual, lessThan, lessOrEqual), and value for comparisons.',
+  parallel: "Use an empty JSON object: {}.",
   workflow:
-    "workflowId (the saved child workflow ID). Recursive definitions are rejected.",
+    "workflowId: the ID of another saved workflow. A workflow cannot call itself, directly or through another workflow.",
   integration:
-    "url, optional method, headers object, body JSON value, timeoutSeconds.",
+    "url: request address. Optional fields: method (HTTP method), headers (JSON object), body (JSON value), timeoutSeconds (number).",
+};
+const kindLabels: Record<NodeKind, string> = {
+  agent: "AI task",
+  tool: "Tool task",
+  command: "Command task",
+  decision: "Decision — unavailable",
+  approval: "Approval task",
+  validation: "Check task",
+  branch: "Branch",
+  parallel: "Parallel paths",
+  workflow: "Run another workflow",
+  integration: "HTTP request",
 };
 
 function defaultConfig(kind: NodeKind): Record<string, unknown> {
@@ -95,8 +110,7 @@ function WorkflowCardNode({ data, selected }: NodeProps<EditorNode>) {
     >
       <Handle type="target" position={Position.Left} />
       <span className="node-kind">
-        {data.node.kind}
-        {data.node.kind === "decision" ? " · unavailable" : ""}
+        {kindLabels[data.node.kind]}
       </span>
       <strong>{data.node.name || data.node.id}</strong>
       <code>{data.node.id}</code>
@@ -116,8 +130,8 @@ export function WorkflowList({ workflows }: { workflows: Workflow[] }) {
   return (
     <>
       <PageHeader
-        title="Reusable workflows"
-        description="Create a Given/When/Then recipe with nested conditions and ordered actions, or edit an advanced execution graph. Both save runnable workflow definitions."
+        title="Workflows"
+        description="A workflow is saved instructions for Factory. Tasks can ask AI to do work, run a command, or wait for approval. To start a workflow manually, choose a project and repository."
       >
         <a className="button primary" href={href("workflows", "new")}>
           New workflow
@@ -133,12 +147,11 @@ export function WorkflowList({ workflows }: { workflows: Workflow[] }) {
             >
               <h2>{workflow.name}</h2>
               <p>
-                {workflow.nodes.length} nodes · {workflow.edges.length} edges ·{" "}
-                {Object.keys(workflow.inputs || {}).length} workflow inputs
+                Tasks: {workflow.declaration ? workflow.declaration.steps.length : workflowActions(workflow).filter((node) => node.kind !== "branch" && node.kind !== "parallel").length}
               </p>
-              {workflow.nodes.some((node) => node.kind === "decision") && (
+              {workflowActions(workflow).some((node) => node.kind === "decision") && (
                 <span className="status status-unavailable">
-                  Contains unavailable decision node
+                  Contains an unavailable decision task
                 </span>
               )}
             </a>
@@ -148,9 +161,8 @@ export function WorkflowList({ workflows }: { workflows: Workflow[] }) {
         <section className="panel empty">
           <h2>No workflows yet</h2>
           <p>
-            Start with a run-start recipe: declare inputs, add ALL / ANY
-            conditions, and order actions. Use the graph editor for advanced
-            dependencies.
+            Name the workflow. Write the task instructions. Save the workflow.
+            Then choose a project and repository before you start it.
           </p>
           <a className="button" href={href("workflows", "new")}>
             Create workflow
@@ -170,8 +182,8 @@ export function WorkflowPage({
   workflows: Workflow[];
   onSaved: (workflow: Workflow) => void;
 }) {
-  const [editor, setEditor] = useState<"recipe" | "graph">(
-    !workflow || recipeFromWorkflow(workflow) ? "recipe" : "graph",
+  const [editor, setEditor] = useState<"declaration" | "stages" | "graph">(
+    !workflow || workflow.declaration ? "declaration" : stagesFromWorkflow(workflow) ? "stages" : "graph",
   );
   const [layout, setLayout] = useState<Layout | null>(
     workflow ? null : { nodes: {} },
@@ -180,7 +192,7 @@ export function WorkflowPage({
   const [reload, setReload] = useState(0);
   const id = workflow?.id;
   useEffect(() => {
-    if (!id) return;
+    if (!id || editor === "declaration") return;
     const controller = new AbortController();
     setError("");
     request<Layout>(`/workflows/${encodeURIComponent(id)}/layout`, {
@@ -191,10 +203,12 @@ export function WorkflowPage({
         if (!controller.signal.aborted) setError(errorMessage(cause));
       });
     return () => controller.abort();
-  }, [id, reload]);
-  if (editor === "recipe")
+  }, [id, reload, editor]);
+  if (editor === "declaration")
+    return <DeclarationEditor workflow={workflow} workflows={workflows} onSaved={onSaved} />;
+  if (editor === "stages")
     return (
-      <RecipeEditor
+      <StageEditor
         workflow={workflow}
         workflows={workflows}
         onSaved={onSaved}
@@ -208,18 +222,18 @@ export function WorkflowPage({
         <ErrorNotice message={error} />
         {error ? (
           <button onClick={() => setReload(reload + 1)}>
-            Retry loading layout
+            Retry loading box positions
           </button>
         ) : (
-          <p role="status">Loading saved graph layout…</p>
+          <p role="status">Loading saved box positions…</p>
         )}
       </>
     );
   return (
     <>
-      {(!workflow || recipeFromWorkflow(workflow)) && (
+      {(!workflow || stagesFromWorkflow(workflow)) && (
         <div className="actions">
-          <button onClick={() => setEditor("recipe")}>Recipe editor</button>
+          <button onClick={() => setEditor("stages")}>Edit steps</button>
         </div>
       )}
       <WorkflowEditor
@@ -288,7 +302,7 @@ function WorkflowEditor({
     const id = `${addKind}_${crypto.randomUUID().slice(0, 8)}`;
     const node: WorkflowNode = {
       id,
-      name: addKind === "decision" ? "Unavailable decision" : addKind,
+      name: kindLabels[addKind],
       kind: addKind,
       outputType:
         addKind === "approval"
@@ -367,7 +381,7 @@ function WorkflowEditor({
             edge.target === connection.target,
         )
       ) {
-        setError("Connect distinct nodes without duplicating an edge.");
+        setError("Connect two different tasks. Do not add the same connection twice.");
         return;
       }
       const pending = [connection.target];
@@ -376,7 +390,7 @@ function WorkflowEditor({
         const id = pending.pop()!;
         if (id === connection.source) {
           setError(
-            "This connection would create a cycle. Workflows must be DAGs.",
+            "This connection would create a loop. A task cannot connect back to itself, directly or through other tasks.",
           );
           return;
         }
@@ -443,7 +457,7 @@ function WorkflowEditor({
       if (!layoutOnly) {
         const declarations = parseObject<unknown>(
           inputDeclarations,
-          "Workflow input declarations",
+          "Run input definitions",
         );
         for (const [inputName, type] of Object.entries(declarations))
           if (
@@ -452,7 +466,7 @@ function WorkflowEditor({
             !valueTypes.some((entry) => entry === type)
           )
             throw new Error(
-              `Workflow input “${inputName}” requires a supported type name.`,
+              `Run input “${inputName}” needs a supported type name.`,
             );
         const workflowInputs = Object.fromEntries(
           Object.entries(declarations).map(([key, type]) => [
@@ -472,18 +486,18 @@ function WorkflowEditor({
               !valueTypes.some((type) => type === input.type)
             )
               throw new Error(
-                `Node ${data.node.name}, input ${inputName}: supply a supported type.`,
+                `Task ${data.node.name}, input ${inputName}: use a supported type.`,
               );
             if (Object.hasOwn(input, "value") === Object.hasOwn(input, "from"))
               throw new Error(
-                `Node ${data.node.name}, input ${inputName}: provide exactly one of value or from.`,
+                `Task ${data.node.name}, input ${inputName}: provide exactly one of value or from.`,
               );
             if (
               Object.hasOwn(input, "from") &&
               (typeof input.from !== "string" || !input.from.includes("."))
             )
               throw new Error(
-                `Node ${data.node.name}, input ${inputName}: from must be inputs.NAME or NODEID.OUTPUT.`,
+                `Task ${data.node.name}, input ${inputName}: from must be inputs.NAME or NODEID.OUTPUT.`,
               );
           }
           return {
@@ -512,7 +526,7 @@ function WorkflowEditor({
         onSaved(saved);
         graphSaved = true;
       }
-      if (!id) throw new Error("Save the workflow before saving its layout.");
+      if (!id) throw new Error("Save the workflow before saving box positions.");
       await request<Layout>(`/workflows/${encodeURIComponent(id)}/layout`, {
         method: "PUT",
         body: JSON.stringify({
@@ -524,13 +538,13 @@ function WorkflowEditor({
       });
       setMessage(
         layoutOnly
-          ? "Layout saved separately. Workflow logic was not changed."
-          : "Workflow and separate graph layout saved.",
+          ? "Box positions saved. Task instructions and run order did not change."
+          : "Workflow and box positions saved.",
       );
       if (!workflow) window.location.hash = href("workflows", id);
     } catch (cause) {
       setError(
-        `${graphSaved ? "Workflow saved, but layout was not saved. Retry “Save layout only”. " : ""}${errorMessage(cause)}`,
+        `${graphSaved ? "Workflow saved, but box positions were not saved. Retry “Save positions only”. " : ""}${errorMessage(cause)}`,
       );
     } finally {
       setSaving(false);
@@ -541,7 +555,7 @@ function WorkflowEditor({
     <>
       <PageHeader
         title={workflow ? workflow.name : "New workflow"}
-        description="Drag nodes to arrange. Connect right handles to left handles. Select a node or edge to configure it."
+        description="Advanced: edit connections. Boxes are tasks. Lines show run order. Drag boxes to move them. Connect a right dot to a left dot. Select a box or line to edit it."
       >
         <a className="button" href={href("workflows")}>
           All workflows
@@ -566,19 +580,19 @@ function WorkflowEditor({
           />
         </label>
         <label className="field">
-          <span>Node kind</span>
+          <span>Task type</span>
           <select
             value={addKind}
             onChange={(event) => setAddKind(event.target.value as NodeKind)}
           >
             {nodeKinds.map((kind) => (
               <option key={kind} value={kind}>
-                {kind === "decision" ? "decision — unavailable" : kind}
+                {kindLabels[kind]}
               </option>
             ))}
           </select>
         </label>
-        <button onClick={addNode}>Add node</button>
+        <button onClick={addNode}>Add task</button>
         <button
           className="danger"
           disabled={!selectedNode && !selectedEdge}
@@ -588,7 +602,7 @@ function WorkflowEditor({
         </button>
         <div className="toolbar-spacer" />
         <button disabled={saving || !savedId} onClick={() => void save(true)}>
-          Save layout only
+          Save positions only
         </button>
         <button
           className="primary"
@@ -599,7 +613,7 @@ function WorkflowEditor({
         </button>
       </div>
       <div className="workflow-workspace">
-        <div className="graph-canvas" aria-label="Workflow graph editor">
+        <div className="graph-canvas" aria-label="Advanced: edit connections">
           <ReactFlow<EditorNode, EditorEdge>
             nodes={nodes}
             edges={edges}
@@ -633,21 +647,21 @@ function WorkflowEditor({
           </ReactFlow>
           {!nodes.length && (
             <div className="canvas-empty">
-              Choose a node kind above and add your first node.
+              Name the workflow. Choose a task type and add a task. Write its instructions and save. Then choose a project and repository before you start it.
             </div>
           )}
         </div>
-        <aside className="node-inspector" aria-label="Graph selection settings">
+        <aside className="node-inspector" aria-label="Task and connection settings">
           {selectedNode ? (
             <div className="stack">
-              <h2>Node settings</h2>
+              <h2>Task settings</h2>
               <label className="field">
-                <span>Node ID</span>
+                <span>Task ID</span>
                 <input readOnly value={selectedNode.id} />
-                <small>Use this ID in input references.</small>
+                <small>Use this ID to read this task's result in another task's inputs.</small>
               </label>
               <label className="field">
-                <span>Node name</span>
+                <span>Task name</span>
                 <input
                   value={selectedNode.data.node.name}
                   onChange={(event) =>
@@ -661,7 +675,7 @@ function WorkflowEditor({
                 />
               </label>
               <label className="field">
-                <span>Kind</span>
+                <span>Task type</span>
                 <select
                   value={selectedNode.data.node.kind}
                   onChange={(event) =>
@@ -670,12 +684,12 @@ function WorkflowEditor({
                 >
                   {nodeKinds.map((kind) => (
                     <option key={kind} value={kind}>
-                      {kind === "decision" ? "decision — unavailable" : kind}
+                      {kindLabels[kind]}
                     </option>
                   ))}
                 </select>
                 <small>
-                  Changing kind resets its configuration and output type.
+                  Changing the type resets the configuration and result type.
                 </small>
               </label>
               <p
@@ -688,7 +702,7 @@ function WorkflowEditor({
                 {kindDescriptions[selectedNode.data.node.kind]}
               </p>
               <label className="field">
-                <span>Repository slot</span>
+                <span>Repository name</span>
                 <input
                   value={selectedNode.data.node.repository || ""}
                   onChange={(event) =>
@@ -699,15 +713,15 @@ function WorkflowEditor({
                       },
                     })
                   }
-                  placeholder="Logical slot name"
+                  placeholder="primary"
                 />
                 <small>
-                  Required for agent, command, tool, and validation. Bind this
-                  slot to a repository in each project.
+                  Required for AI, command, tool, and check tasks. Map this
+                  name to a repository in each project.
                 </small>
               </label>
               <label className="field">
-                <span>Result output type</span>
+                <span>Result type</span>
                 <select
                   value={selectedNode.data.node.outputType || "object"}
                   onChange={(event) =>
@@ -724,21 +738,21 @@ function WorkflowEditor({
                   ))}
                 </select>
                 <small>
-                  Output name is result. Approvals produce Approval; branches
-                  produce boolean.
+                  The output is named result. Approval tasks return Approval.
+                  Branches return boolean (true or false).
                 </small>
               </label>
               <JsonField
-                label="Node inputs (JSON)"
+                label="Task inputs (JSON)"
                 value={selectedNode.data.inputText}
                 onChange={(inputText) => updateNode({ inputText })}
                 help={
-                  'Object keyed by input name: {"type":"string","from":"inputs.NAME"} or {"type":"object","from":"NODEID.result"} or {"type":"boolean","value":true}.'
+                  'Use a JSON object with one entry per input name. Each entry needs type (value type) and exactly one of value (fixed value) or from (reference). Example: {"request":{"type":"string","from":"inputs.NAME"}}. Use inputs.NAME for a run input or NODEID.result for a task result. A fixed value example is {"ready":{"type":"boolean","value":true}}.'
                 }
                 rows={7}
               />
               <JsonField
-                label="Configuration (JSON)"
+                label="Task configuration (JSON)"
                 value={selectedNode.data.configText}
                 onChange={(configText) => updateNode({ configText })}
                 help={configHelp[selectedNode.data.node.kind]}
@@ -746,7 +760,7 @@ function WorkflowEditor({
               />
               {selectedNode.data.node.kind === "workflow" && (
                 <details>
-                  <summary>Available child workflow IDs</summary>
+                  <summary>Saved workflow IDs</summary>
                   <ul className="compact-list">
                     {workflows
                       .filter((entry) => entry.id !== savedId)
@@ -760,12 +774,12 @@ function WorkflowEditor({
                 </details>
               )}
               <button className="danger" onClick={removeSelection}>
-                Delete node and its edges
+                Delete task and its connections
               </button>
             </div>
           ) : selectedEdge ? (
             <div className="stack">
-              <h2>Edge settings</h2>
+              <h2>Connection settings</h2>
               <dl>
                 <dt>From</dt>
                 <dd>
@@ -778,7 +792,7 @@ function WorkflowEditor({
               </dl>
               {selectedSource?.data.node.kind === "branch" ? (
                 <label className="field">
-                  <span>Branch condition</span>
+                  <span>Use this line when the branch returns</span>
                   <select
                     value={selectedEdge.data?.when || ""}
                     onChange={(event) => {
@@ -795,43 +809,43 @@ function WorkflowEditor({
                     }}
                   >
                     <option value="" disabled>
-                      Select condition
+                      Select result
                     </option>
                     <option value="true">true</option>
                     <option value="false">false</option>
                   </select>
                   <small>
-                    This path is selected only when the branch result matches.
+                    Factory uses this line only when the branch result matches.
                   </small>
                 </label>
               ) : (
                 <p className="muted">
-                  Unconditional dependency. Conditions are only available on
-                  edges leaving a branch node.
+                  This line sets the run order. Only lines from a branch can
+                  have a condition.
                 </p>
               )}
               <button className="danger" onClick={removeSelection}>
-                Delete edge
+                Delete connection
               </button>
             </div>
           ) : (
             <>
-              <h2>Graph configuration</h2>
+              <h2>Connection editor</h2>
               <p className="muted">
-                Select a node to configure its type, repository slot, inputs,
-                and output. Select an edge to set branch conditions. Delete
-                removes the selected graph element.
+                Select a box to edit its task type, repository, inputs, and
+                result. Select a line to set a branch condition. Delete removes
+                the selected task or connection.
               </p>
               <p className="muted">
-                Every node waits for its predecessors. Independent nodes can
-                execute concurrently up to the project's limit.
+                Each task waits for the tasks connected before it. Tasks on
+                separate paths can run at the same time, up to the project's limit.
               </p>
             </>
           )}
         </aside>
       </div>
       <section className="panel workflow-inputs">
-        <h2>Workflow input declaration</h2>
+        <h2>Run inputs</h2>
         <JsonField
           label="Input names and types (JSON)"
           value={inputDeclarations}
@@ -841,7 +855,7 @@ function WorkflowEditor({
           }}
           rows={5}
           help={
-            'Map input names to type names, for example {"request":"string"}. Nodes reference them with inputs.request. Supported types: ' +
+            'Use a JSON object with input names as keys and type names as values, for example {"request":"string"}. Tasks read these values with inputs.request. Supported types: ' +
             valueTypes.join(", ") +
             "."
           }

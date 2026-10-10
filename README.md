@@ -1,6 +1,6 @@
 # Factory
 
-A local Go/SQLite daemon and React UI for running reusable workflows against Git repositories, with opt-in GitHub issue-to-draft-PR intake and workflow-defined PR feedback revisions. No Temporal or demo adapters.
+A local Go/SQLite daemon and React UI for running declarative workflows against Git repositories, with opt-in GitHub issue-to-draft-PR intake and workflow-defined PR feedback revisions. No Temporal or demo adapters.
 
 ## Run
 
@@ -17,6 +17,21 @@ Open **http://127.0.0.1:8080**. The daemon serves `web/dist` and `/api`, storing
 `make dev` starts the real daemon and Vite at port 5173. `FACTORY_DATA` overrides its data directory; `.env.example` is not automatically loaded. `make test` runs Go race tests and the frontend build; `make lint` checks formatting, Go vet, and TypeScript.
 
 The attached Strategy Game project and real verification runs are stored in the local, ignored `.factory-data/v2` directory. Use `.factory-data/bin/factoryd -data .factory-data/v2` to reopen them. Legacy `.factory-data` databases are untouched and are not imported into the new model.
+
+### UI-only workflow playground
+
+To explore the Workflows page without starting or connecting to the daemon:
+
+```sh
+npm --prefix web ci # first time only
+make dev-ui
+```
+
+This opens **http://127.0.0.1:5173/#/workflows** with the declarative Given/If/Then editor. Existing step-based and custom graph workflows retain their editors. Only Node 22.12+ and npm are needed for the playground; it does not build Go binaries or require OMP. The equivalent frontend command is `npm --prefix web run dev:ui`. Stop Vite with **Ctrl-C**.
+
+Workflows and separate graph layouts save to browser local storage and survive reloads. Saves are scoped to the browser and origin (host/port), never imported from or written to daemon data. Clearing site storage removes playground saves. Storage failures are shown rather than reported as successful saves.
+
+This mode is **editing only**: no projects, bindings, runs, commands, agents, or GitHub operations. API proxying is disabled even if a real daemon is running. Editor checks still apply, but daemon workflow validation and execution are not exercised; a playground save does not prove a workflow will execute successfully. Use `make dev` for real execution. Both modes use port 5173, so stop the current UI before switching; do not restart an active daemon.
 
 ### Rebuild and restart the running daemon
 
@@ -58,26 +73,101 @@ Do not rebuild or restart the daemon while a managed job is active; shutdown int
 ## Configure and run
 
 1. Create a project; attach existing local Git roots. Configure the harness executable/model and project-wide parallelism.
-2. Create a reusable workflow in **Workflows**. New workflows open in the Given/When/Then recipe editor: declare typed run inputs, add nested **ALL / ANY** conditions, and order actions by dragging or using Up/Down. Saved recipes are execution graphs, not freeform English; existing complex graphs stay editable in the graph editor. Graph positions and viewport are saved separately from execution semantics.
-3. Add a project binding: map workflow repository slots to attached repositories and supply typed inputs.
-4. Start the binding. Observe real node outputs, events, logs, artifacts, child runs, and approval controls.
+2. Open **Workflows → New workflow**. Name the workflow and write the agent objective under **What must the AI do?**. The starter runs one agent in repository slot `primary`, with no required start data. Add named start data, an optional **Given** guard, and ordered **If / Then steps** as needed. Save does not run anything. Agent tasks can change files; adding a later approval does not undo those changes.
+3. Open **Projects** and choose a project. Under **Workflow bindings**, select **New binding**. Choose your saved workflow. Map `primary` to a repository attached to that project. A binding connects the workflow to its project folder. Supply start data only if the workflow requires it.
+4. Select **Save binding & start run** when ready. Inspect the task results and logs. At an approval task, approve to continue or reject to stop the run.
+
+### Declarative Given / If / Then
+
+The workflow's `declaration` is the source of truth. The daemon compiles it into the existing durable execution graph on save and load; supplied `nodes` and `edges` cannot override a declaration. Runs retain immutable compiled snapshots, so later edits do not change admitted work. Graph-only definitions and existing step-editor workflows remain supported without lossy conversion.
+
+- **Given** guards the whole workflow. A false guard skips its actions.
+- **Named actions** configure real agents, commands, tools, checks, approvals, HTTP requests, or saved child workflows. Reuse an action in multiple steps.
+- **Then** steps execute in order. Every matching **If** executes independently; this is not first-match routing. A false If skips only its step and continues. Failure blocks downstream execution.
+- **Save result as** names a result for later conditions and inputs. For structured process output, `Diagnosis.repositoryCount` means the JSON field inside `result.data`, without graph node IDs or the envelope prefix. Non-structured outputs expose envelope fields such as `Result.exitCode`. Input mappings pass the full typed result envelope, including `data`.
+- Conditions support nested **all/any**, equality, numeric comparisons, existence, and `contains` / `notContains`. Array membership uses exact JSON equality (labels are case-sensitive); text containment uses substrings. Missing fields do not satisfy comparisons except `notExists`. Missing or skipped *result sources* fail the condition, even if another rule could short-circuit; use a child workflow to group dependent conditional work.
+- Omitted step inputs inherit the action's inputs, or forward workflow start data if those are also omitted. An explicit `{}` passes no inputs. Child workflows must receive their declared inputs with matching types and share the binding's repository mappings.
+
+**Example guard** offers the bug, review, dependency-author, and delivery conditions. It only supplies `Given` and a `WorkItem` input—not action implementations or event subscriptions. Configure the work item fields yourself at the binding/run boundary. Names such as `CreatePR`, `ApprovalWorkflow`, or `MergePR` do not provide GitHub operations, authorization, safety classification, or managed worktrees. Existing managed intake remains separate and unchanged.
+
+#### Defaults and completion loops
+
+| Setting | Default | Override |
+|---|---|---|
+| Agent model | Project harness model | Workflow default, then action `config.model` |
+| Action timeout | 3600 seconds | Workflow default, then action `config.timeoutSeconds`; applies to agents, processes, and HTTP |
+| Agent completion limit | 3 passes | Workflow default, then action `config.maxIterations`; integer 1–20 |
+| Repetition | One pass | Enable **Repeat until semantic completion** and configure **Until conditions** |
+
+An Until loop requires JSON output. Factory instructs the agent to return a complete JSON object; the default condition is `result.data.status == "Complete"`. After a successful but incomplete pass, the next receives `previousResult` with the prior typed envelope. A process error or invalid JSON fails immediately—this is not an automatic error retry. Exhausting the bound fails and blocks downstream work. Timeout covers the entire action, all passes share one attempt transcript with iteration markers, and artifacts are collected only after completion. An interrupted action retains the existing explicit-retry policy; successful intermediate passes are not independently replayable checkpoints.
+
+Example API definition for read-only issue readiness assessment followed by human clarification review:
+
+```json
+{
+  "id": "issue-readiness", "name": "Issue readiness",
+  "inputs": {"WorkItem": "object"},
+  "declaration": {
+    "version": 1,
+    "given": {"all": [
+      {"path": "WorkItem.kind", "operator": "equals", "value": "Issue"},
+      {"path": "WorkItem.labels", "operator": "contains", "value": "agent/workflow:review"}
+    ]},
+    "actions": {
+      "IssueReview": {
+        "kind": "agent", "repository": "primary",
+        "config": {
+          "prompt": "Read WorkItem and inspect repository context without changing files or GitHub. Assess whether the issue has enough detail to implement and verify. Return status Complete or Incomplete, with reasons and clarification questions.",
+          "outputJson": true
+        }
+      },
+      "ReviewClarification": {
+        "kind": "approval",
+        "config": {"message": "Read Assessment in the previous task output. Resolve its clarification questions before approving. This does not post a GitHub comment."}
+      }
+    },
+    "steps": [
+      {"id": "assess", "run": "IssueReview", "as": "Assessment"},
+      {"id": "clarify", "run": "ReviewClarification",
+       "if": {"path": "Assessment.status", "operator": "equals", "value": "Incomplete"},
+       "inputs": {"Assessment": {"type": "object", "from": "Assessment"}}}
+    ]
+  }
+}
+```
+
+Save through `POST /api/workflows`, create a project binding, and supply a typed `WorkItem` value when starting it. No graph fields are needed. The daemon validates named references, types, child workflow contracts, conditions, and settings; declarations are capped at 256 actions/steps and 1 MiB.
+
+### Execution primitives and existing editors
 
 Factory controls execution, not repository skills, rules, or system prompts. Agent nodes pass a workflow pre-prompt and typed input data to `omp -p` in the selected repository. Authentication, configuration, and repository discovery are inherited from your normal environment. Tool nodes call repository scripts; no Factory manifest is required inside a repository.
 
 | Node | Configuration |
 |---|---|
-| Agent | `prompt`; optional `timeoutSeconds`, `artifacts` |
-| Command / tool / validation | `command` argv array; optional `timeoutSeconds`, `artifacts` |
+| Agent | `prompt` (task objective); optional `outputJson`, `model`, `timeoutSeconds`, `artifacts`, `maxIterations`, `until` (branch condition group over input `result`) |
+| Command / tool / validation | `command` argv array; optional `outputJson`, `timeoutSeconds`, `artifacts` |
 | Approval | `message`; explicit approval continues, rejection fails |
-| Branch | Legacy: `input` name and `equals` JSON value. Recipes: `conditions` group (`combinator`: `all`/`any`, nonempty `rules`) containing nested groups or rules with `input`, optional dotted object `property`, `operator` (`equals`, `notEquals`, `exists`, `notExists`), and `value` for comparisons. Outgoing edges labeled `true`/`false` |
+| Branch | Legacy: `input` name and `equals` JSON value. Conditions: group (`combinator`: `all`/`any`, nonempty `rules`) containing nested groups or rules with `input`, optional dotted object `property`, `operator` (`equals`, `notEquals`, `contains`, `notContains`, `exists`, `notExists`, `greaterThan`, `greaterOrEqual`, `lessThan`, `lessOrEqual`), and `value` for comparisons. Numeric comparisons require finite numbers without string coercion. Outgoing edges labeled `true`/`false` |
 | Parallel | Fan-out/barrier using graph edges; waits for every predecessor |
 | Nested workflow | `workflowId`; inherits repository mappings; node inputs become child inputs |
 | Integration | Real HTTP `url`; optional `method`, `headers`, JSON `body`, `timeoutSeconds`; non-2xx fails |
 | Decision | **Unavailable** until a decision provider is implemented; never fabricates a result |
 
-In a recipe, **WHEN** means a project binding is explicitly started; it does not subscribe to GitHub issues or change intake authorization. **GIVEN** evaluates the branch conditions against typed run inputs (a missing or null property satisfies `notExists`); false skips the action sequence. **THEN** actions execute in order, with each next action starting only after the previous one succeeds. Failed actions stop the run; explicit Retry remains subject to existing managed-workflow restrictions. The recipe editor does not express automatic failure handlers, waits, parallel fan-out, or arbitrary graph merges—use the graph editor where supported instead of assuming Gherkin text has execution semantics.
+Existing step-based workflows use short instructions and consistent terms based on [ASD-STE100 writing principles](https://asd-ste100.org/STE_faq.html). This is STE-style interface copy, not a claim of full specification compliance. That editor calls stages **steps**, rules **task groups**, and actions **tasks**. Its graph execution behavior has not changed.
+
+Add, remove, or move steps and tasks as needed. **Add another task** offers AI, commands, project tools, checks, approval, web requests, and saved workflows. For a command, put the program on the first line and each argument on a new line. Spaces on a line stay within one argument. Shell features require an explicit shell program. Added steps and task groups contain a real approval task; change it if you need a different task.
+
+**Optional: conditions and task order** controls a task group. Define **Values to check** from start data or task results in earlier steps. Select an optional dotted field path and value type. The condition builder can match all or any conditions, including nested groups. A missing or null field matches `notExists`. A missing or skipped source stops the run; Factory does not invent a value. Turn conditions off to run the group every time; saved conditions are retained.
+
+Steps and task groups run in their displayed order. Factory tries every group, not just the first match. If conditions do not match, it skips that group and continues. Task order is **One at a time** by default. **Together · wait for all** lets tasks start within the project's concurrency limit. Factory waits for all tasks, including approval tasks. A failed task or rejected approval stops later tasks. Tasks that already started may finish. Approval cannot override a failed check.
+
+**Advanced task settings** contains task names and types, project folder names, JSON output, result types, inputs, and configuration. **Read the run order** shows a plain-language summary. **Advanced: workflow JSON** shows the compiled definition. Save stays disabled until the editor's checks pass; daemon validation still applies. Existing workflows keep their settings. Stage metadata is accepted only when it compiles to the saved graph. Convertible linear workflows open as one step. Custom graphs stay in **Advanced: edit connections**; their run order is not flattened or replaced with stale metadata. Layout positions remain separate from execution.
+
+A manual run still requires a project binding. Editing does not subscribe to GitHub events, grant permission, create managed worktrees, or publish pull requests. Managed issue and review jobs keep their separate permission checks and exact-SHA publication boundaries. Names alone add no behavior; model overrides and completion loops require the explicit settings described above. Explicit run Retry keeps the existing managed-workflow restrictions. Automatic GitHub approval and merging are not provided by this declarative authoring change.
 
 Workflow inputs declare names and types. Node inputs contain `type` and either `value` or `from` (`inputs.NAME` or `ANCESTOR.result`). Command inputs are available as `FACTORY_INPUTS` JSON. Outputs use typed `result` envelopes: commands/agents expose `exitCode`, `stdout`, `stderr`; integrations expose `status`, `body`. Domain types such as `TestResult` and `ReviewFinding` label object payloads, not custom schema validation. Process output envelopes are capped at 64 KiB per stream; complete attempt logs remain available. Artifacts are repository-relative files copied into Factory storage.
+
+For agent, command, tool, and validation tasks, enable **Read the task output as JSON** (`outputJson: true`) in **Advanced task settings** when later conditions need values from task output. A successful task must print one complete JSON object to stdout, exposed as `NODE.result` → `data` (for example, field `data.complexity` or `data.repository_count`). Invalid JSON, non-object output, or output exceeding the 64 KiB capture limit fails the task and blocks dependent work. Normal stdout/stderr/exitCode remain available; agents cannot add tasks or bypass configured approvals through this data.
 
 ## GitHub connection and labels
 

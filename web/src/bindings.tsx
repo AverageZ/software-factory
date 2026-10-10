@@ -9,6 +9,7 @@ import {
   valueText,
 } from "./components";
 import type { Binding, Project, Run, Workflow } from "./types";
+import { workflowActions } from "./declarative";
 
 function repositorySlots(
   workflow: Workflow | undefined,
@@ -18,7 +19,7 @@ function repositorySlots(
   if (!workflow || seen.has(workflow.id)) return [];
   seen.add(workflow.id);
   const slots = new Set<string>();
-  for (const node of workflow.nodes) {
+  for (const node of workflowActions(workflow)) {
     if (node.repository) slots.add(node.repository);
     if (node.kind === "workflow") {
       const child = workflows.find(
@@ -246,7 +247,7 @@ export function BindingPage({
                 onChange={setValues}
               />
             </fieldset>
-            {workflow.nodes.some((node) => node.kind === "decision") && (
+            {workflowActions(workflow).some((node) => node.kind === "decision") && (
               <div className="notice warning">
                 This workflow contains an unavailable decision node. It cannot
                 complete successfully until that node is replaced.

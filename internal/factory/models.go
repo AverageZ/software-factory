@@ -85,11 +85,12 @@ type Edge struct {
 	When   string `json:"when,omitempty"`
 }
 type Workflow struct {
-	ID     string            `json:"id"`
-	Name   string            `json:"name"`
-	Nodes  []WorkflowNode    `json:"nodes"`
-	Edges  []Edge            `json:"edges"`
-	Inputs map[string]string `json:"inputs,omitempty"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Nodes       []WorkflowNode    `json:"nodes"`
+	Edges       []Edge            `json:"edges"`
+	Inputs      map[string]string `json:"inputs,omitempty"`
+	Declaration *Declaration      `json:"declaration,omitempty"`
 }
 type Position struct {
 	X float64 `json:"x"`

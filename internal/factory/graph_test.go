@@ -1,7 +1,11 @@
 package factory
 
 import (
+	"context"
 	"encoding/json"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -145,7 +149,7 @@ func TestBranchConditionWorkflowValidation(t *testing.T) {
 		"invalid path":     map[string]any{"combinator": "all", "rules": []any{map[string]any{"input": "payload", "property": "user..role", "operator": "exists"}}},
 		"missing value":    map[string]any{"combinator": "all", "rules": []any{map[string]any{"input": "payload", "operator": "equals"}}},
 		"extra value":      map[string]any{"combinator": "all", "rules": []any{map[string]any{"input": "payload", "operator": "notExists", "value": nil}}},
-		"unknown operator": map[string]any{"combinator": "all", "rules": []any{map[string]any{"input": "payload", "operator": "contains", "value": "a"}}},
+		"unknown operator": map[string]any{"combinator": "all", "rules": []any{map[string]any{"input": "payload", "operator": "matchesRegex", "value": "a"}}},
 		"extra field":      map[string]any{"combinator": "all", "rules": []any{map[string]any{"input": "payload", "operator": "exists", "ignored": true}}},
 	}
 	deep := map[string]any{"input": "payload", "operator": "exists"}
@@ -352,5 +356,213 @@ func TestRecipeActionsWaitForSuccessAndSkipWhenConditionsAreFalse(t *testing.T) 
 				t.Fatalf("unexpected ordered recipe states: %+v", got)
 			}
 		})
+	}
+}
+
+func TestBranchNumericConditions(t *testing.T) {
+	inputs := map[string]Input{"payload": {Type: "object"}}
+	for _, operator := range []string{"greaterThan", "greaterOrEqual", "lessThan", "lessOrEqual"} {
+		t.Run(operator, func(t *testing.T) {
+			rule := map[string]any{"input": "payload", "property": "data.score", "operator": operator, "value": float64(10)}
+			group := map[string]any{"combinator": "all", "rules": []any{rule}}
+			if err := validateBranchConditions(group, inputs); err != nil {
+				t.Fatal(err)
+			}
+			for _, actual := range []any{float64(9), float64(10), float64(11), nil, "11", true, 11, json.Number("11"), map[string]any{}, []any{}, math.NaN(), math.Inf(1), math.Inf(-1)} {
+				want := false
+				if number, ok := actual.(float64); ok && !math.IsNaN(number) && !math.IsInf(number, 0) {
+					switch operator {
+					case "greaterThan":
+						want = number > 10
+					case "greaterOrEqual":
+						want = number >= 10
+					case "lessThan":
+						want = number < 10
+					case "lessOrEqual":
+						want = number <= 10
+					}
+				}
+				values := map[string]Value{"payload": {Type: "object", Value: map[string]any{"data": map[string]any{"score": actual}}}}
+				if got := evaluateBranchConditions(group, values); got != want {
+					t.Fatalf("actual %#v: got %v, want %v", actual, got, want)
+				}
+			}
+			for _, values := range []map[string]Value{nil, {"payload": {Type: "object", Value: map[string]any{}}}, {"payload": {Type: "object", Value: map[string]any{"data": map[string]any{}}}}} {
+				if evaluateBranchConditions(group, values) {
+					t.Fatal("missing numeric input matched")
+				}
+			}
+			for _, invalid := range []any{nil, "10", true, 10, json.Number("10"), math.NaN(), math.Inf(1), math.Inf(-1)} {
+				rule["value"] = invalid
+				if err := validateBranchConditions(group, inputs); err == nil {
+					t.Fatalf("invalid comparison %#v accepted", invalid)
+				}
+			}
+			delete(rule, "value")
+			if err := validateBranchConditions(group, inputs); err == nil {
+				t.Fatal("missing comparison accepted")
+			}
+			rule["value"] = float64(10)
+			rule["ignored"] = true
+			if err := validateBranchConditions(group, inputs); err == nil {
+				t.Fatal("numeric condition with unknown field accepted")
+			}
+		})
+	}
+}
+
+func TestWorkflowOutputJSONValidation(t *testing.T) {
+	for _, kind := range []string{"agent", "command", "tool", "validation", "parallel", "approval", "branch", "integration"} {
+		for _, value := range []any{true, false, "true", nil, float64(1)} {
+			n := WorkflowNode{ID: "task", Kind: kind, Repository: "repo", Config: map[string]any{"outputJson": value, "command": []any{"sh", "-c", "true"}, "prompt": "Return JSON", "message": "Review", "url": "https://example.com", "input": "payload", "equals": true}}
+			if kind == "branch" {
+				n.Inputs = map[string]Input{"payload": {Type: "boolean", From: "inputs.payload"}}
+			}
+			w := Workflow{ID: "structured", Name: "Structured", Inputs: map[string]string{"payload": "boolean"}, Nodes: []WorkflowNode{n}}
+			err := validateDefinitions(map[string]Workflow{w.ID: w})
+			_, boolean := value.(bool)
+			allowed := kind == "agent" || kind == "command" || kind == "tool" || kind == "validation"
+			if (err == nil) != (boolean && allowed) {
+				t.Fatalf("kind %s outputJson %#v: %v", kind, value, err)
+			}
+		}
+	}
+}
+
+func TestStructuredTaskOutputRoutesBranches(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, stdout string
+		exit               bool
+		wantError          bool
+		wantMatch          bool
+	}{
+		{"command object", "command", `{"score":10,"ready":true}`, false, false, true},
+		{"tool object", "tool", `{"score":11,"ready":true}`, false, false, true},
+		{"validation object", "validation", `{"score":9,"ready":true}`, false, false, false},
+		{"agent object", "agent", ` {"score":10,"ready":true} ` + "\n", false, false, true},
+		{"equality false", "command", `{"score":10,"ready":false}`, false, false, false},
+		{"numeric string", "command", `{"score":"10","ready":true}`, false, false, false},
+		{"numeric null", "command", `{"score":null,"ready":true}`, false, false, false},
+		{"missing numeric", "command", `{"ready":true}`, false, false, false},
+		{"empty object", "command", `{}`, false, false, false},
+		{"malformed", "command", `{"score":`, false, true, false},
+		{"array", "command", `[{"score":10}]`, false, true, false},
+		{"null", "command", `null`, false, true, false},
+		{"string", "command", `"text"`, false, true, false},
+		{"number", "command", `10`, false, true, false},
+		{"empty", "command", ``, false, true, false},
+		{"extra JSON", "command", `{} {}`, false, true, false},
+		{"extra text", "command", `{} commentary`, false, true, false},
+		{"nonfinite number", "command", `{"score":1e999}`, false, true, false},
+		{"capture truncation", "command", `{"text":"` + strings.Repeat("x", outputLimit) + `"}`, false, true, false},
+		{"valid prefix truncated", "command", `{"score":10,"ready":true}` + strings.Repeat(" ", outputLimit), false, true, false},
+		{"process failure", "command", `{"score":10,"ready":true}`, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			repo := t.TempDir()
+			script := filepath.Join(repo, "task.sh")
+			body := "#!/bin/sh\nprintf '%s' '" + tc.stdout + "'\nprintf '%s' 'diagnostic' >&2\n"
+			if tc.exit {
+				body += "exit 7\n"
+			}
+			if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+				t.Fatal(err)
+			}
+			task := WorkflowNode{ID: "task", Kind: tc.kind, Repository: "repo", Config: map[string]any{"outputJson": true, "command": []any{script}, "prompt": "Return a JSON object"}}
+			gate := WorkflowNode{ID: "gate", Kind: "branch", Inputs: map[string]Input{"payload": {Type: "object", From: "task.result"}}, Config: map[string]any{"conditions": map[string]any{"combinator": "all", "rules": []any{
+				map[string]any{"input": "payload", "property": "data.score", "operator": "greaterOrEqual", "value": float64(10)},
+				map[string]any{"input": "payload", "property": "data.ready", "operator": "equals", "value": true},
+			}}}}
+			workflow := Workflow{ID: "structured-routing", Name: "Structured routing", Nodes: []WorkflowNode{task, gate, {ID: "yes", Kind: "parallel"}, {ID: "no", Kind: "parallel"}}, Edges: []Edge{{ID: "task-gate", Source: "task", Target: "gate"}, {ID: "yes-edge", Source: "gate", Target: "yes", When: "true"}, {ID: "no-edge", Source: "gate", Target: "no", When: "false"}}}
+			if err := validateDefinitions(map[string]Workflow{workflow.ID: workflow}); err != nil {
+				t.Fatal(err)
+			}
+			project := Project{ID: "project", Repositories: []Repository{{ID: "repository", Path: repo}}, Harness: Harness{Binary: script}}
+			r := newRun(project, Binding{Repositories: map[string]string{"repo": "repository"}}, workflow, nil, nil, "")
+			result := e.perform(context.Background(), r, task, nil, 1)
+			if (result.err != nil) != tc.wantError {
+				t.Fatalf("execution error: %v", result.err)
+			}
+			envelope := result.outputs["result"].Value.(map[string]any)
+			if envelope["stderr"] != "diagnostic" || envelope["stdout"] == nil {
+				t.Fatalf("missing process envelope: %+v", envelope)
+			}
+			if tc.wantError {
+				if _, exists := envelope["data"]; exists {
+					t.Fatal("failed task exposed structured data")
+				}
+				log, err := os.ReadFile(filepath.Join(e.data, logRelative(r.Run.ID, task.ID, 1)))
+				if err != nil || !strings.Contains(string(log), "[Factory:") {
+					t.Fatalf("failed task diagnostic missing from log: %v", err)
+				}
+			} else if _, ok := envelope["data"].(map[string]any); !ok {
+				t.Fatalf("structured data missing: %+v", envelope)
+			}
+			x := r.Run.Nodes["task"]
+			x.Status = "succeeded"
+			x.Outputs = result.outputs
+			if result.err != nil {
+				x.Status = "failed"
+				x.Error = result.err.Error()
+			}
+			r.Run.Nodes["task"] = x
+			e.mu.Lock()
+			e.runs[r.Run.ID] = r
+			for range 3 {
+				if _, err := e.pumpLocked(); err != nil {
+					e.mu.Unlock()
+					t.Fatal(err)
+				}
+			}
+			got := e.runs[r.Run.ID].Run.Nodes
+			e.mu.Unlock()
+			if tc.wantError {
+				if got["gate"].Status == "succeeded" || got["yes"].Status == "succeeded" || got["no"].Status == "succeeded" {
+					t.Fatalf("invalid task output routed successfully: %+v", got)
+				}
+			} else {
+				yes, no := "skipped", "succeeded"
+				if tc.wantMatch {
+					yes, no = "succeeded", "skipped"
+				}
+				if got["gate"].Outputs["result"].Value != tc.wantMatch || got["yes"].Status != yes || got["no"].Status != no {
+					t.Fatalf("incorrect structured data routing: %+v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestTaskOutputJSONIsOptIn(t *testing.T) {
+	e, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	repo := t.TempDir()
+	project := Project{ID: "project", Repositories: []Repository{{ID: "repository", Path: repo}}}
+	for _, configured := range []bool{false, true} {
+		task := WorkflowNode{ID: "task", Kind: "command", Repository: "repo", Config: map[string]any{"command": []any{"/bin/sh", "-c", "printf 'plain text'"}}}
+		if configured {
+			task.Config["outputJson"] = false
+		}
+		workflow := Workflow{ID: "plain-output", Name: "Plain output", Nodes: []WorkflowNode{task}}
+		r := newRun(project, Binding{Repositories: map[string]string{"repo": "repository"}}, workflow, nil, nil, "")
+		result := e.perform(context.Background(), r, task, nil, 1)
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		envelope := result.outputs["result"].Value.(map[string]any)
+		if envelope["stdout"] != "plain text" || envelope["exitCode"] != 0 || envelope["stderr"] != "" {
+			t.Fatalf("plain process output changed: %+v", envelope)
+		}
+		if _, exists := envelope["data"]; exists {
+			t.Fatal("plain process output acquired structured data")
+		}
 	}
 }

@@ -95,6 +95,79 @@ func (e *Engine) perform(ctx context.Context, r savedRun, n WorkflowNode, inputs
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(seconds*float64(time.Second)))
 		defer cancel()
 	}
+	defer func() {
+		if result.err != nil {
+			return
+		}
+		paths, err := artifactPaths(n)
+		if err != nil {
+			result.err = err
+			return
+		}
+		if len(paths) == 0 {
+			return
+		}
+		for _, repository := range r.Project.Repositories {
+			if repository.ID == r.Binding.Repositories[n.Repository] {
+				result.artifacts, result.err = e.copyArtifacts(ctx, repository.Path, r.Run.ID, n.ID, attempt, paths)
+				return
+			}
+		}
+		result.err = fmt.Errorf("artifact repository slot %s is not bound", n.Repository)
+	}()
+	if err := validateAgentSettings(n); err != nil {
+		result.err = err
+		return
+	}
+	until, looping := n.Config["until"]
+	limit := 1
+	if looping {
+		limit = defaultAgentIterations
+		if configured, ok := n.Config["maxIterations"].(float64); ok {
+			limit = int(configured)
+		}
+	}
+	for iteration := 1; iteration <= limit; iteration++ {
+		if err := ctx.Err(); err != nil {
+			result.err = err
+			return
+		}
+		if looping {
+			if _, err := fmt.Fprintf(log, "\n[Factory: completion iteration %d of %d]\n", iteration, limit); err != nil {
+				result.err = err
+				return
+			}
+		}
+		result = e.performPass(ctx, r, n, inputs, log)
+		if result.err != nil || !looping {
+			return
+		}
+		if evaluateBranchConditions(until.(map[string]any), result.outputs) {
+			return
+		}
+		if iteration == limit {
+			result.err = fmt.Errorf("agent completion condition was not met after %d iterations", limit)
+			_, err := fmt.Fprintf(log, "\n[Factory: %v]\n", result.err)
+			result.err = errors.Join(result.err, err)
+			return
+		}
+		// Do not mutate the snapshotted inputs. A successful but incomplete
+		// result is feedback, not a retry of a failed process.
+		if iteration == 1 {
+			next := make(map[string]Value, len(inputs)+1)
+			for key, value := range inputs {
+				next[key] = value
+			}
+			inputs = next
+		}
+		inputs["previousResult"] = result.outputs["result"]
+	}
+	return
+}
+
+func (e *Engine) performPass(ctx context.Context, r savedRun, n WorkflowNode, inputs map[string]Value, log *transcript) (result executionResult) {
+	result.outputs = map[string]Value{}
+	result.artifacts = []string{}
 	if n.Kind == "integration" {
 		result.outputs, result.err = performHTTP(ctx, n, log)
 		return
@@ -112,8 +185,20 @@ func (e *Engine) perform(ctx context.Context, r savedRun, n WorkflowNode, inputs
 		return
 	}
 	var args []string
+	var err error
 	if n.Kind == "agent" {
 		prompt := configString(n, "prompt")
+		if outputJSON, _ := n.Config["outputJson"].(bool); outputJSON {
+			prompt += "\n\nReturn one complete JSON object on stdout, without Markdown fences or surrounding prose."
+		}
+		if until, ok := n.Config["until"]; ok {
+			condition, err := json.Marshal(until)
+			if err != nil {
+				result.err = err
+				return
+			}
+			prompt += "\n\nFactory evaluates this completion condition against the result envelope: " + string(condition) + ". If previousResult is supplied, continue from that successful but incomplete iteration. Do not claim completion unless the work and checks are complete."
+		}
 		if len(inputs) > 0 {
 			encoded, err := json.MarshalIndent(inputs, "", "  ")
 			if err != nil {
@@ -124,7 +209,11 @@ func (e *Engine) perform(ctx context.Context, r savedRun, n WorkflowNode, inputs
 		}
 		// Only execution presentation/model flags are supplied. HOME, auth,
 		// configuration, skills and repository rule discovery remain inherited.
-		args = []string{r.Project.Harness.Binary, "--model", r.Project.Harness.Model, "--no-title", "--no-pty", "-p", prompt}
+		model := configString(n, "model")
+		if model == "" {
+			model = r.Project.Harness.Model
+		}
+		args = []string{r.Project.Harness.Binary, "--model", model, "--no-title", "--no-pty", "-p", prompt}
 	} else {
 		args, err = commandArgs(n)
 		if err != nil {
@@ -187,19 +276,27 @@ func (e *Engine) perform(ctx context.Context, r savedRun, n WorkflowNode, inputs
 		}
 		result.err = err
 	}
-	result.outputs["result"] = Value{Type: nodeOutputType(n), Value: map[string]any{"exitCode": exitCode, "stdout": stdout.String(), "stderr": stderr.String()}}
+	envelope := map[string]any{"exitCode": exitCode, "stdout": stdout.String(), "stderr": stderr.String()}
+	if outputJSON, _ := n.Config["outputJson"].(bool); outputJSON && result.err == nil {
+		var data map[string]any
+		switch {
+		case stdout.truncated:
+			result.err = fmt.Errorf("structured task output exceeded the 64 KiB capture limit")
+		default:
+			if err := json.Unmarshal(stdout.data.Bytes(), &data); err != nil {
+				result.err = fmt.Errorf("structured task output must be a complete JSON object: %w", err)
+			} else if data == nil {
+				result.err = fmt.Errorf("structured task output must be a JSON object, not null")
+			} else {
+				envelope["data"] = data
+			}
+		}
+	}
+	result.outputs["result"] = Value{Type: nodeOutputType(n), Value: envelope}
 	if result.err != nil {
 		_, writeErr := fmt.Fprintf(log, "\n[Factory: %v]\n", result.err)
 		result.err = errors.Join(result.err, writeErr)
 		return
-	}
-	paths, err := artifactPaths(n)
-	if err != nil {
-		result.err = err
-		return
-	}
-	if len(paths) > 0 {
-		result.artifacts, result.err = e.copyArtifacts(ctx, cwd, r.Run.ID, n.ID, attempt, paths)
 	}
 	return
 }
