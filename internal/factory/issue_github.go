@@ -206,7 +206,10 @@ func findIssuePR(ctx context.Context, j savedIssueJob) (*issuePullRequest, error
 	return &prs[0], nil
 }
 func createIssuePR(ctx context.Context, j savedIssueJob) (issuePullRequest, error) {
-	body := fmt.Sprintf("Closes #%d\n\nImplemented and validated in an isolated Factory worktree. Review the changes and the Factory run evidence before marking ready or merging.\n\nFactory run: `%s`\nBase: `%s`\nCandidate: `%s`\n\n%s", j.Number, j.RunID, j.BaseSHA, j.HeadSHA, issuePRMarker(j.ID))
+	if j.PRBody == "" {
+		return issuePullRequest{}, fmt.Errorf("validated PR body is missing; draft publication blocked")
+	}
+	body := formatIssuePRBody(j)
 	data, err := gitHubAPI(ctx, "POST", fmt.Sprintf("repositories/%d/pulls", j.GitHubRepositoryID), "-f", "title="+j.Title, "-f", "head="+j.Branch, "-f", "base="+j.BaseBranch, "-f", "body="+body, "-F", "draft=true")
 	var pr issuePullRequest
 	if err == nil {

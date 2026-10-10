@@ -46,6 +46,7 @@ type savedIssueJob struct {
 	Repository Repository       `json:"repository"`
 	Connection GitHubConnection `json:"connection"`
 	Body       string           `json:"body"`
+	PRBody     string           `json:"prBody,omitempty"`
 	BaseBranch string           `json:"baseBranch"`
 }
 type IntakeReport struct {
@@ -517,6 +518,21 @@ func (e *Engine) workIssue(ctx context.Context, j savedIssueJob) {
 	e.mu.Unlock()
 	if runStatus != "succeeded" {
 		fail("failed", fmt.Errorf("implementation run ended %s; publication blocked", runStatus))
+		return
+	}
+	if j.PRBody == "" {
+		body, err := readIssuePRBody(j.Worktree, j.ID)
+		if err != nil {
+			fail("failed", err)
+			return
+		}
+		j.PRBody = body
+		if err = e.saveIssueJob(j); err != nil {
+			return
+		}
+	}
+	if err = removeIssuePRBody(j.Worktree, j.ID); err != nil {
+		fail("failed", err)
 		return
 	}
 	if j.HeadSHA == "" {
