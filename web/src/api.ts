@@ -1,4 +1,7 @@
 import { useEffect, useState } from "react";
+import { playgroundRequest } from "./playgroundStorage";
+
+export const isPlayground = import.meta.env.MODE === "playground";
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -8,6 +11,7 @@ export async function request<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
+  if (isPlayground) return playgroundRequest(path, options) as T;
   const response = await fetch(`/api${path}`, {
     ...options,
     headers: {

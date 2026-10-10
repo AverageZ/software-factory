@@ -84,6 +84,13 @@ func Open(data string) (*Engine, error) {
 	if e.workflows, err = loadRecords[Workflow](s, "workflow"); err != nil {
 		return fail(err)
 	}
+	for id, workflow := range e.workflows {
+		compiled, err := compileDeclaration(workflow)
+		if err != nil {
+			return fail(fmt.Errorf("stored workflow %s: %w", id, err))
+		}
+		e.workflows[id] = compiled
+	}
 	if e.bindings, err = loadRecords[Binding](s, "binding"); err != nil {
 		return fail(err)
 	}
@@ -301,6 +308,11 @@ func (e *Engine) SaveWorkflow(w Workflow) (Workflow, error) {
 	if w.ID == "" {
 		w.ID = uuid.NewString()
 	}
+	compiled, err := compileDeclaration(w)
+	if err != nil {
+		return w, invalid(err)
+	}
+	w = compiled
 	if w.Edges == nil {
 		w.Edges = []Edge{}
 	}

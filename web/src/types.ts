@@ -160,12 +160,31 @@ export interface WorkflowEdge {
   target: string;
   when?: "true" | "false";
 }
+export type Condition =
+  | { all: Condition[] }
+  | { any: Condition[] }
+  | { path: string; operator: string; value?: unknown };
+export interface DeclarationStep {
+  id: string;
+  run: string;
+  as?: string;
+  if?: Condition;
+  inputs?: Record<string, Input>;
+}
+export interface Declaration {
+  version: 1;
+  defaults?: { model?: string; timeoutSeconds?: number; maxIterations?: number };
+  actions: Record<string, WorkflowNode>;
+  given?: Condition;
+  steps: DeclarationStep[];
+}
 export interface Workflow {
   id: string;
   name: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   inputs?: Record<string, string>;
+  declaration?: Declaration;
 }
 export interface Layout {
   nodes: Record<string, { x: number; y: number }>;
