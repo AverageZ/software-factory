@@ -67,7 +67,8 @@ export interface IssueJob {
     | "published"
     | "closed"
     | "failed"
-    | "interrupted";
+    | "interrupted"
+    | "released";
   error?: string;
   runId?: string;
   branch?: string;
@@ -91,13 +92,30 @@ export interface ReviewJob {
   feedbackKeys: string[];
   updatedAt: string;
 }
+export interface SyncJob {
+  id: string;
+  issueJobId: string;
+  pullRequestNumber: number;
+  status: string;
+  error?: string;
+  runId?: string;
+  worktree?: string;
+  pullRequestHeadSHA: string;
+  baseSHA: string;
+  headSHA?: string;
+  conflicted: boolean;
+  updatedAt: string;
+}
 export interface IntakeReport {
   enabled: boolean;
+  issueBindingId?: string;
   reviewBindingId?: string;
+  syncBindingId?: string;
   checkedAt: string;
   error?: string;
   jobs: IssueJob[];
   revisions: ReviewJob[];
+  synchronizations: SyncJob[];
 }
 
 export const valueTypes = [

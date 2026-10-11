@@ -141,6 +141,8 @@ func TestAuthorizeReviewPRChecksCurrentPRAndIssueLabels(t *testing.T) {
 	check(true)
 	issue.Labels = append(issue.Labels, gitHubLabelResponse{Name: "agent/mode:repair"})
 	check(true)
+	issue.Labels = append(issue.Labels, gitHubLabelResponse{Name: "agent/workflow:sync"})
+	check(true)
 	issue.Labels = append(issue.Labels, gitHubLabelResponse{Name: "agent/workflow:bug"})
 	check(false)
 	issue.Labels = issue.Labels[:2]

@@ -129,3 +129,161 @@ esac
 		t.Fatalf("developer checkout changed: %q, %v", contents, err)
 	}
 }
+
+func TestReleaseRetainedIssueJobPreservesCheckpoint(t *testing.T) {
+	f := newWorkspaceFixture(t)
+	store, err := openStore(f.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	e := &Engine{
+		store:       store,
+		data:        f.data,
+		ctx:         ctx,
+		stop:        stop,
+		projects:    map[string]Project{},
+		intakes:     map[string]intakeConfig{},
+		issueJobs:   map[string]savedIssueJob{},
+		reviewJobs:  map[string]savedReviewJob{},
+		intakeBusy:  map[string]bool{},
+		issueActive: map[string]bool{},
+		active:      map[string]activeExecution{},
+		errors:      make(chan error, 1),
+	}
+	defer e.Close()
+
+	releaseLease, err := acquireIssueLease(f.repository, "retained-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := prepareIssueWorkspace(ctx, f.data, f.repository, "retained-job", f.remote, "main")
+	if err != nil {
+		releaseLease()
+		t.Fatal(err)
+	}
+	workspace = workspaceTestCheckpoint(t, f, workspace)
+	releaseLease()
+
+	project := Project{ID: "project", Repositories: []Repository{{ID: "repository", Path: f.repository}}, Policy: Policy{MaxParallel: 1}}
+	e.projects[project.ID] = project
+	e.intakes[githubKey(project.ID, "repository")] = intakeConfig{Enabled: true, ProjectID: project.ID, RepositoryID: "repository", RepositoryPath: f.repository}
+	job := savedIssueJob{
+		IssueJob:   IssueJob{ID: "retained-job", ProjectID: project.ID, RepositoryID: "repository", Status: "interrupted"},
+		Project:    project,
+		Repository: project.Repositories[0],
+	}
+	job.setWorkspace(workspace)
+	if err = e.saveIssueJob(job); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = e.releaseRetainedIssueJob(ctx, project.ID, "repository", job.ID, strings.Repeat("0", 40), ""); err == nil {
+		t.Fatal("release accepted a stale checkpoint identity")
+	}
+	retained := filepath.Join(workspace.Path, "uncheckpointed.txt")
+	if err = os.WriteFile(retained, []byte("preserve me\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = e.releaseRetainedIssueJob(ctx, project.ID, "repository", job.ID, workspace.HeadSHA, ""); err == nil {
+		t.Fatal("release deleted an uncheckpointed change")
+	}
+	if data, readErr := os.ReadFile(retained); readErr != nil || string(data) != "preserve me\n" {
+		t.Fatalf("retained change was lost: %q, %v", data, readErr)
+	}
+	if err = os.Remove(retained); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := e.releaseRetainedIssueJob(ctx, project.ID, "repository", job.ID, workspace.HeadSHA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Jobs) != 1 || report.Jobs[0].Status != "released" || report.Jobs[0].Worktree != "" {
+		t.Fatalf("released job state = %+v", report.Jobs)
+	}
+	if _, err = os.Stat(workspace.Path); !os.IsNotExist(err) {
+		t.Fatalf("released worktree still exists: %v", err)
+	}
+	if head := workspaceTestGit(t, f.repository, "rev-parse", "refs/heads/"+workspace.Branch); head != workspace.HeadSHA {
+		t.Fatalf("checkpoint branch changed: %s", head)
+	}
+}
+
+func TestReleaseRetainedIssueJobReleasesVerifiedNoChangeWorkspace(t *testing.T) {
+	f := newWorkspaceFixture(t)
+	store, err := openStore(f.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	e := &Engine{
+		store:       store,
+		data:        f.data,
+		ctx:         ctx,
+		stop:        stop,
+		projects:    map[string]Project{},
+		intakes:     map[string]intakeConfig{},
+		issueJobs:   map[string]savedIssueJob{},
+		reviewJobs:  map[string]savedReviewJob{},
+		intakeBusy:  map[string]bool{},
+		issueActive: map[string]bool{},
+		active:      map[string]activeExecution{},
+		errors:      make(chan error, 1),
+	}
+	defer e.Close()
+
+	releaseLease, err := acquireIssueLease(f.repository, "no-change-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := prepareIssueWorkspace(ctx, f.data, f.repository, "no-change-job", f.remote, "main")
+	releaseLease()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	project := Project{ID: "project", Repositories: []Repository{{ID: "repository", Path: f.repository}}, Policy: Policy{MaxParallel: 1}}
+	e.projects[project.ID] = project
+	e.intakes[githubKey(project.ID, "repository")] = intakeConfig{Enabled: true, ProjectID: project.ID, RepositoryID: "repository", RepositoryPath: f.repository}
+	job := savedIssueJob{
+		IssueJob:   IssueJob{ID: "no-change-job", ProjectID: project.ID, RepositoryID: "repository", Status: "failed"},
+		Project:    project,
+		Repository: project.Repositories[0],
+	}
+	job.setWorkspace(workspace)
+	if err = e.saveIssueJob(job); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = e.releaseRetainedIssueJob(ctx, project.ID, "repository", job.ID, "", strings.Repeat("0", 40)); err == nil {
+		t.Fatal("release accepted a stale base identity")
+	}
+	retained := filepath.Join(workspace.Path, "uncheckpointed.txt")
+	if err = os.WriteFile(retained, []byte("preserve me\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = e.releaseRetainedIssueJob(ctx, project.ID, "repository", job.ID, "", workspace.BaseSHA); err == nil {
+		t.Fatal("release deleted an uncheckpointed change")
+	}
+	if data, readErr := os.ReadFile(retained); readErr != nil || string(data) != "preserve me\n" {
+		t.Fatalf("retained change was lost: %q, %v", data, readErr)
+	}
+	if err = os.Remove(retained); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := e.releaseRetainedIssueJob(ctx, project.ID, "repository", job.ID, "", workspace.BaseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Jobs) != 1 || report.Jobs[0].Status != "released" || report.Jobs[0].Worktree != "" {
+		t.Fatalf("released job state = %+v", report.Jobs)
+	}
+	if _, err = os.Stat(workspace.Path); !os.IsNotExist(err) {
+		t.Fatalf("released worktree still exists: %v", err)
+	}
+	if head := workspaceTestGit(t, f.repository, "rev-parse", "refs/heads/"+workspace.Branch); head != workspace.BaseSHA {
+		t.Fatalf("no-change branch moved: %s", head)
+	}
+}

@@ -27,7 +27,7 @@ func TestIssueAuthorizationSelectors(t *testing.T) {
 		{"observe cannot publish", "open", []string{"agent:run", "agent/mode:observe"}, false, false},
 		{"manage cannot bypass repair", "open", []string{"agent:run", "agent/mode:manage"}, false, false},
 		{"conflicting modes", "open", []string{"agent:run", "agent/mode:repair", "agent/mode:observe"}, false, false},
-		{"unsupported workflow", "open", []string{"agent:run", "agent/workflow:review"}, false, false},
+		{"configured selector syntax", "open", []string{"agent:run", "agent/workflow:review"}, false, true},
 		{"conflicting workflows", "open", []string{"agent:run", "agent/workflow:bug", "agent/workflow:rollback"}, false, false},
 	}
 	for _, tc := range cases {
@@ -96,8 +96,12 @@ esac
 	p := Project{ID: "p", Repositories: []Repository{{ID: "r", Path: repo}}, Policy: Policy{MaxParallel: 0}}
 	c := intakeConfig{Enabled: true, ProjectID: "p", RepositoryID: "r", RepositoryPath: repo, Connection: GitHubConnection{ID: 123, Host: "github.com", CanPush: true}}
 	e.projects[p.ID] = p
+	workflow, binding := issueBindingFixture("p", "r", "issue-binding", "configured issue behavior")
+	c.IssueBindingID = binding.ID
+	e.workflows = map[string]Workflow{workflow.ID: workflow}
+	e.bindings = map[string]Binding{binding.ID: binding}
 	e.intakes[key] = c
-	err = e.store.save(record{"project", p.ID, p}, record{"intake", key, c})
+	err = e.store.save(record{"project", p.ID, p}, record{"intake", key, c}, record{"workflow", workflow.ID, workflow}, record{"binding", binding.ID, binding})
 	e.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -117,6 +121,11 @@ esac
 			want := "queued"
 			if j.Number == 2465 {
 				want = "paused"
+			} else {
+				snapshot := e.issueJobs[j.ID]
+				if snapshot.Binding.ID != binding.ID || configString(snapshot.Workflow.Nodes[0], "prompt") != "configured issue behavior" {
+					t.Fatalf("admission lost configured workflow snapshot: %+v", snapshot)
+				}
 			}
 			if j.Status != want {
 				t.Fatalf("issue %d = %s; want %s", j.Number, j.Status, want)

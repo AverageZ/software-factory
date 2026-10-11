@@ -35,17 +35,24 @@ func TestIssuePublicationStopsOnRevocationDuringBaseLookup(t *testing.T) {
 			p := Project{ID: "project", Repositories: []Repository{{ID: "repo", Path: f.repository}}, Policy: Policy{MaxParallel: 1}}
 			connection := GitHubConnection{ID: 123, Host: "github.com", Owner: "owner", Name: "repo", DefaultBranch: "main"}
 			config := intakeConfig{Enabled: true, ProjectID: p.ID, RepositoryID: "repo", RepositoryPath: f.repository, Connection: connection}
+			configured, binding := issueBindingFixture(p.ID, "repo", "managed-issue", "Configured behavior")
+			config.IssueBindingID = binding.ID
+			e.workflows = map[string]Workflow{configured.ID: configured}
+			e.bindings = map[string]Binding{binding.ID: binding}
 			e.projects[p.ID] = p
 			e.intakes[githubKey(p.ID, "repo")] = config
-			workflow := Workflow{ID: "managed", Nodes: []WorkflowNode{{ID: "implement", Kind: "agent"}, {ID: "publish", Kind: "integration"}}, Edges: []Edge{{Source: "implement", Target: "publish"}}}
-			run := newRun(p, Binding{}, workflow, nil, nil, "")
+			workflow := copyJSON(configured)
+			workflow.Nodes = append(workflow.Nodes, WorkflowNode{ID: "factory-publish", Kind: "integration"})
+			workflow.Edges = []Edge{{Source: workflow.Nodes[0].ID, Target: "factory-publish"}}
+			run := newRun(p, binding, workflow, nil, nil, "")
 			run.IssueJobID = "revoked"
 			run.Run.Status = "running"
-			node := run.Run.Nodes["implement"]
+			node := run.Run.Nodes[configured.Nodes[0].ID]
 			node.Status = "succeeded"
-			run.Run.Nodes["implement"] = node
+			run.Run.Nodes[configured.Nodes[0].ID] = node
 			e.runs[run.Run.ID] = run
 			j := savedIssueJob{IssueJob: IssueJob{ID: "revoked", ProjectID: p.ID, RepositoryID: "repo", GitHubRepositoryID: 123, Number: 1, Title: "Repair", Status: "publishing", RunID: run.Run.ID}, Project: p, Repository: p.Repositories[0], Connection: connection, Body: "Fix it", BaseBranch: "main"}
+			j.Binding, j.Workflow = binding, configured
 			j.setWorkspace(w)
 			if err = e.store.save(record{"run", run.Run.ID, run}, record{"intake", githubKey(p.ID, "repo"), config}); err != nil {
 				t.Fatal(err)

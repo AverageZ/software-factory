@@ -1,9 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import { errorMessage, href, post, request, timestamp } from "./api";
 import { ErrorNotice, Status } from "./components";
-import type { Binding, GitHubConnection, IntakeReport, IssueJob } from "./types";
+import type {
+  Binding,
+  GitHubConnection,
+  IntakeReport,
+  IssueJob,
+  ReviewJob,
+  SyncJob,
+} from "./types";
 
-type Action = "load" | "enable" | "disable" | "poll" | "review";
+type Action =
+  | "load"
+  | "enable"
+  | "disable"
+  | "poll"
+  | "issue"
+  | "review"
+  | "sync"
+  | "release"
+  | "recover";
+type RecoveryAction = "retry" | "dismiss";
+type ManagedJob = ReviewJob | SyncJob;
 
 export function IssueIntake({
   projectId,
@@ -23,6 +41,8 @@ export function IssueIntake({
   const [busy, setBusy] = useState<Action | null>("load");
   const [bindings, setBindings] = useState<Binding[]>([]);
   const [reviewBinding, setReviewBinding] = useState("");
+  const [issueBinding, setIssueBinding] = useState("");
+  const [syncBinding, setSyncBinding] = useState("");
   const [error, setError] = useState("");
   const mounted = useRef(false);
 
@@ -35,6 +55,8 @@ export function IssueIntake({
         if (!controller.signal.aborted) {
           setReport(next);
           setReviewBinding(next.reviewBindingId ?? "");
+          setIssueBinding(next.issueBindingId ?? "");
+          setSyncBinding(next.syncBindingId ?? "");
         }
       })
       .catch((cause: unknown) => {
@@ -54,7 +76,7 @@ export function IssueIntake({
       })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted)
-          setError(`Could not load review bindings. ${errorMessage(cause)}`);
+          setError(`Could not load workflow bindings. ${errorMessage(cause)}`);
       });
     return () => {
       mounted.current = false;
@@ -81,10 +103,17 @@ export function IssueIntake({
           ? await request<IntakeReport>(endpoint)
           : action === "poll"
             ? await post<IntakeReport>(`${endpoint}/poll`)
-            : action === "review"
-              ? await request<IntakeReport>(`${endpoint}/review`, {
+            : action === "review" || action === "issue" || action === "sync"
+              ? await request<IntakeReport>(`${endpoint}/${action}`, {
                   method: "PUT",
-                  body: JSON.stringify({ bindingId: reviewBinding }),
+                  body: JSON.stringify({
+                    bindingId:
+                      action === "issue"
+                        ? issueBinding
+                        : action === "review"
+                          ? reviewBinding
+                          : syncBinding,
+                  }),
                 })
               : await request<IntakeReport>(endpoint, {
                   method: "PUT",
@@ -93,6 +122,8 @@ export function IssueIntake({
       if (mounted.current) {
         setReport(next);
         setReviewBinding(next.reviewBindingId ?? "");
+        setIssueBinding(next.issueBindingId ?? "");
+        setSyncBinding(next.syncBindingId ?? "");
       }
     } catch (cause) {
       if (!mounted.current) return;
@@ -105,6 +136,84 @@ export function IssueIntake({
       setError(
         `${message} Refresh intake status before retrying. Any report below is historical. ${errorMessage(cause)}`,
       );
+    } finally {
+      if (mounted.current) {
+        setBusy(null);
+        onBusyChange(false);
+      }
+    }
+  }
+
+  async function release(job: IssueJob) {
+    if (controlsDisabled || !report || (!job.headSHA && !job.baseSHA)) return;
+    const checkpointed = Boolean(job.headSHA);
+    const message = checkpointed
+      ? `Release the retained candidate for issue #${job.number}? Factory will remove its clean managed worktree, keep checkpoint branch ${job.branch ?? "(unknown)"}, and allow queued work to start. The candidate will not be published.`
+      : `Release the no-change workspace for issue #${job.number}? Factory will remove it only if it is clean and still exactly matches its recorded base, then allow queued work to start.`;
+    if (!window.confirm(message)) return;
+    setBusy("release");
+    onBusyChange(true);
+    setError("");
+    try {
+      const next = await post<IntakeReport>(
+        `${endpoint}/jobs/${encodeURIComponent(job.id)}/release`,
+        { headSHA: job.headSHA ?? "", baseSHA: job.baseSHA ?? "" },
+      );
+      if (mounted.current) setReport(next);
+    } catch (cause) {
+      if (mounted.current)
+        setError(
+          `Could not release the retained workspace. It was preserved. Refresh intake status before retrying. ${errorMessage(cause)}`,
+        );
+    } finally {
+      if (mounted.current) {
+        setBusy(null);
+        onBusyChange(false);
+      }
+    }
+  }
+
+  async function recover(
+    kind: "revisions" | "synchronizations",
+    job: ManagedJob,
+    action: RecoveryAction,
+  ) {
+    if (controlsDisabled || !report) return;
+    const work = kind === "revisions" ? "revision" : "synchronization";
+    const retained = job.worktree
+      ? " This permanently deletes the retained worktree and its uncommitted changes."
+      : "";
+    const outcome =
+      action === "retry"
+        ? " Factory will admit a fresh attempt if the PR is still eligible."
+        : " Factory will treat this feedback or synchronization observation as handled.";
+    if (
+      !window.confirm(
+        `${action === "retry" ? "Retry" : "Dismiss"} the failed PR ${work} for #${job.pullRequestNumber}?${retained}${outcome}`,
+      )
+    )
+      return;
+    setBusy("recover");
+    onBusyChange(true);
+    setError("");
+    try {
+      const next = await post<IntakeReport>(
+        `${endpoint}/${kind}/${encodeURIComponent(job.id)}/recover`,
+        {
+          action,
+          baseSHA: job.baseSHA ?? "",
+          headSHA: job.headSHA ?? "",
+          ...("pullRequestHeadSHA" in job
+            ? { pullRequestHeadSHA: job.pullRequestHeadSHA }
+            : {}),
+        },
+      );
+      if (mounted.current) setReport(next);
+    } catch (cause) {
+      if (mounted.current)
+        setError(
+          `Could not recover the failed PR ${work}. Its retained state was preserved. Refresh intake status before retrying. ${errorMessage(cause)}`,
+        );
     } finally {
       if (mounted.current) {
         setBusy(null);
@@ -132,11 +241,12 @@ export function IssueIntake({
         </span>
       </div>
       <p className="muted">
-        Opt in to let <code>agent:run</code> select the default issue-to-draft-PR
-        workflow. No extra workflow or mode labels are required. OMP writes in
-        isolated worktrees, not your checkout. Factory never auto-merges PRs.
-        Unsupported or ambiguous workflow/mode labels block a job. Enabling intake
-        also creates an editable PR feedback revision workflow for this repository.
+        Workflows are functions. Bindings set their repository and inputs.
+        On an open issue, <code>agent:run</code> calls the selected issue binding
+        with the issue as an input. An optional <code>agent/workflow:BINDING_ID</code>
+        label selects another configured binding. Unknown or conflicting selectors
+        block work. Factory runs the agent in an isolated worktree and publishes
+        a draft PR. It does not create workflows or merge PRs.
       </p>
       <ErrorNotice message={error} />
       <ErrorNotice message={report?.error ? `Intake poll: ${report.error}` : ""} />
@@ -172,6 +282,36 @@ export function IssueIntake({
         </button>
       </div>
       <label>
+        Issue workflow binding
+        <select
+          value={issueBinding}
+          disabled={controlsDisabled}
+          onChange={(event) => setIssueBinding(event.target.value)}
+        >
+          <option value="">None — do not run issue work</option>
+          {bindings.map((binding) => (
+            <option key={binding.id} value={binding.id}>
+              {binding.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button
+        type="button"
+        disabled={controlsDisabled || !report || issueBinding === (report.issueBindingId ?? "")}
+        onClick={() => void perform("issue")}
+      >
+        {busy === "issue" ? "Saving issue binding…" : "Save issue binding"}
+      </button>
+      <p className="muted">
+        Select a configured workflow with one agent node and no edges. Its agent
+        must target this repository and receive <code>issue</code> (object) from
+        <code>inputs.issue</code>. Set other workflow inputs in the binding.
+        Other graph shapes are not supported for managed intake. A binding
+        save reports any configuration error. Without a valid issue binding,
+        intake does no work.
+      </p>
+      <label>
         PR feedback revision binding
         <select
           value={reviewBinding}
@@ -194,12 +334,45 @@ export function IssueIntake({
         {busy === "review" ? "Saving review binding…" : "Save review binding"}
       </button>
       <p className="muted">
-        A PR feedback revision workflow is selected automatically when issue intake
-        is enabled. Edit that workflow or choose another binding with one agent node
-        receiving <code>pullRequest</code> (object) and <code>feedback</code> (array).
-        Its <code>feedbackSources</code> selects review surfaces. Choose Off to disable
-        revisions. On an open owned PR, <code>agent:run</code> authorizes action;
-        trusted review feedback automatically selects <code>agent/workflow:review</code>.
+        Revisions are off until you select a configured binding. The workflow must
+        have one agent node and no edges, receiving <code>pullRequest</code> (object)
+        and <code>feedback</code> (array) from workflow inputs. Its
+        <code>feedbackSources</code> selects <code>conversation</code>,
+        <code>inline</code>, or <code>review</code>. Choose Off to stop revisions.
+        On an open owned PR, <code>agent:run</code> authorizes action; trusted review
+        feedback selects the configured revision binding and Factory adds
+        <code>agent/workflow:review</code> only if no conflicting selector is present.
+      </p>
+      <label>
+        PR synchronization binding
+        <select
+          value={syncBinding}
+          disabled={controlsDisabled}
+          onChange={(event) => setSyncBinding(event.target.value)}
+        >
+          <option value="">Off — do not synchronize PR branches</option>
+          {bindings.map((binding) => (
+            <option key={binding.id} value={binding.id}>
+              {binding.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button
+        type="button"
+        disabled={controlsDisabled || !report || syncBinding === (report.syncBindingId ?? "")}
+        onClick={() => void perform("sync")}
+      >
+        {busy === "sync" ? "Saving synchronization binding…" : "Save synchronization binding"}
+      </button>
+      <p className="muted">
+        Synchronization is off until you select a configured binding. The workflow
+        must have one agent node and no edges, receiving <code>pullRequest</code>
+        and <code>synchronization</code> objects from workflow inputs. On an open
+        Factory-owned PR, <code>agent:run</code> authorizes branch updates. Factory
+        adds <code>agent/workflow:sync</code> to show that the PR is monitored,
+        merges the current base in an isolated worktree, runs the agent to resolve
+        conflicts and validate, and uses an exact-head compare-and-swap push.
       </p>
       {!report?.enabled && !canEnable && (
         <p className="muted">
@@ -216,7 +389,15 @@ export function IssueIntake({
       {report && (
         report.jobs.length ? (
           <ul className="github-intake-jobs">
-            {report.jobs.map((job) => <IntakeJob key={job.id} job={job} />)}
+            {report.jobs.map((job) => (
+              <IntakeJob
+                key={job.id}
+                job={job}
+                disabled={controlsDisabled}
+                releasing={busy === "release"}
+                onRelease={release}
+              />
+            ))}
           </ul>
         ) : (
           <p className="muted">No issue jobs recorded for this repository.</p>
@@ -242,6 +423,55 @@ export function IssueIntake({
                 {revision.worktree && (
                   <span>Retained worktree: <code>{revision.worktree}</code></span>
                 )}
+                <ManagedRecoveryActions
+                  job={revision}
+                  disabled={controlsDisabled}
+                  recovering={busy === "recover"}
+                  onRecover={(action) =>
+                    void recover("revisions", revision, action)
+                  }
+                />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {report && report.synchronizations?.length > 0 && (
+        <div className="stack">
+          <h4>PR synchronizations</h4>
+          <ul className="github-intake-jobs">
+            {report.synchronizations.map((synchronization) => (
+              <li className="stack github-intake-job" key={synchronization.id}>
+                <div className="github-report-heading">
+                  PR #{synchronization.pullRequestNumber}{" "}
+                  <Status status={synchronization.status} />
+                </div>
+                <ErrorNotice message={synchronization.error ?? ""} />
+                {synchronization.runId && (
+                  <a href={href("runs", synchronization.runId)}>
+                    View synchronization run
+                  </a>
+                )}
+                <span className="muted">
+                  Base <code>{synchronization.baseSHA.slice(0, 12)}</code>
+                  {" · "}
+                  {synchronization.conflicted
+                    ? "Agent resolved merge conflicts"
+                    : "Merge did not report conflicts"}
+                </span>
+                {synchronization.worktree && (
+                  <span>
+                    Retained worktree: <code>{synchronization.worktree}</code>
+                  </span>
+                )}
+                <ManagedRecoveryActions
+                  job={synchronization}
+                  disabled={controlsDisabled}
+                  recovering={busy === "recover"}
+                  onRecover={(action) =>
+                    void recover("synchronizations", synchronization, action)
+                  }
+                />
               </li>
             ))}
           </ul>
@@ -251,7 +481,60 @@ export function IssueIntake({
   );
 }
 
-function IntakeJob({ job }: { job: IssueJob }) {
+function ManagedRecoveryActions({
+  job,
+  disabled,
+  recovering,
+  onRecover,
+}: {
+  job: ManagedJob;
+  disabled: boolean;
+  recovering: boolean;
+  onRecover: (action: RecoveryAction) => void;
+}) {
+  if (!["failed", "interrupted"].includes(job.status)) return null;
+  return (
+    <div className="stack">
+      <div className="actions">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onRecover("retry")}
+        >
+          {recovering
+            ? "Recovering…"
+            : job.worktree
+              ? "Discard worktree and retry"
+              : "Retry"}
+        </button>
+        <button
+          type="button"
+          className="danger"
+          disabled={disabled}
+          onClick={() => onRecover("dismiss")}
+        >
+          {job.worktree ? "Discard worktree and dismiss" : "Dismiss"}
+        </button>
+      </div>
+      <p className="muted">
+        Retry starts from the current authorized PR state. Dismiss prevents this
+        feedback or synchronization observation from running again.
+      </p>
+    </div>
+  );
+}
+
+function IntakeJob({
+  job,
+  disabled,
+  releasing,
+  onRelease,
+}: {
+  job: IssueJob;
+  disabled: boolean;
+  releasing: boolean;
+  onRelease: (job: IssueJob) => void;
+}) {
   const retained = ["failed", "interrupted", "paused"].includes(job.status);
   const cleanupPending = ["published", "closed"].includes(job.status);
   return (
@@ -310,6 +593,33 @@ function IntakeJob({ job }: { job: IssueJob }) {
         <p className="muted">
           Uncertain, dirty, or untracked work is retained rather than force-deleted.
           Check the job error before attempting manual cleanup.
+        </p>
+      )}
+      {job.worktree && retained && (job.headSHA || job.baseSHA) && (
+        <div className="stack">
+          <button
+            type="button"
+            className="danger"
+            disabled={disabled}
+            onClick={() => onRelease(job)}
+          >
+            {releasing
+              ? "Releasing workspace…"
+              : job.headSHA
+                ? "Release candidate and continue queue"
+                : "Release no-change workspace and continue queue"}
+          </button>
+          <p className="muted">
+            {job.headSHA
+              ? "Release succeeds only for the recorded clean checkpoint. Factory keeps the local checkpoint branch and refuses to remove dirty, changed, or uncheckpointed work."
+              : "Release succeeds only if the workspace is clean and its branch and HEAD still exactly match the recorded base."}
+          </p>
+        </div>
+      )}
+      {job.status === "released" && (
+        <p className="muted">
+          Candidate released. The local checkpoint branch remains available,
+          and this issue will not be admitted again.
         </p>
       )}
     </li>

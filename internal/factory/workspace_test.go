@@ -208,6 +208,35 @@ func TestIssueWorkspaceLeaseExcludesOtherDataDirectoriesAndAbandonedWork(t *test
 	}
 }
 
+func TestRetainedWorkspaceAllowsAnotherManagedJob(t *testing.T) {
+	f := newWorkspaceFixture(t)
+	ctx := context.Background()
+	release, err := acquireIssueLease(f.repository, "retained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := prepareIssueWorkspace(ctx, f.data, f.repository, "retained", f.remote, "main")
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	workspaceTestWrite(t, filepath.Join(w.Path, "unfinished.txt"), []byte("retained for recovery\n"))
+	if err := retainIssueWorkspace(ctx, f.repository, w); err != nil {
+		release()
+		t.Fatal(err)
+	}
+	release()
+
+	other, err := acquireIssueLease(f.repository, "other")
+	if err != nil {
+		t.Fatalf("retained workspace blocked an unrelated managed job: %v", err)
+	}
+	other()
+	if contents, err := os.ReadFile(filepath.Join(w.Path, "unfinished.txt")); err != nil || string(contents) != "retained for recovery\n" {
+		t.Fatalf("retained work changed: %q, %v", contents, err)
+	}
+}
+
 func TestIssueWorkspaceCheckpointIncludesBinaryUntrackedAndDeletion(t *testing.T) {
 	f := newWorkspaceFixture(t)
 	w := workspaceTestPrepare(t, f, "binary")

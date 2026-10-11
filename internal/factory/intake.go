@@ -13,8 +13,9 @@ import (
 type intakeConfig struct {
 	Enabled         bool             `json:"enabled"`
 	ProjectID       string           `json:"projectId"`
+	IssueBindingID  string           `json:"issueBindingId,omitempty"`
 	ReviewBindingID string           `json:"reviewBindingId,omitempty"`
-	ReviewDisabled  bool             `json:"reviewDisabled,omitempty"`
+	SyncBindingID   string           `json:"syncBindingId,omitempty"`
 	RepositoryID    string           `json:"repositoryId"`
 	RepositoryPath  string           `json:"repositoryPath"`
 	Connection      GitHubConnection `json:"connection"`
@@ -46,20 +47,35 @@ type savedIssueJob struct {
 	Repository Repository       `json:"repository"`
 	Connection GitHubConnection `json:"connection"`
 	Body       string           `json:"body"`
+	Binding    Binding          `json:"binding"`
+	Workflow   Workflow         `json:"workflow"`
 	BaseBranch string           `json:"baseBranch"`
 }
 type IntakeReport struct {
-	Enabled         bool        `json:"enabled"`
-	CheckedAt       string      `json:"checkedAt"`
-	Error           string      `json:"error,omitempty"`
-	Jobs            []IssueJob  `json:"jobs"`
-	ReviewBindingID string      `json:"reviewBindingId,omitempty"`
-	Revisions       []ReviewJob `json:"revisions"`
+	Enabled          bool        `json:"enabled"`
+	CheckedAt        string      `json:"checkedAt"`
+	Error            string      `json:"error,omitempty"`
+	Jobs             []IssueJob  `json:"jobs"`
+	IssueBindingID   string      `json:"issueBindingId,omitempty"`
+	ReviewBindingID  string      `json:"reviewBindingId,omitempty"`
+	SyncBindingID    string      `json:"syncBindingId,omitempty"`
+	Revisions        []ReviewJob `json:"revisions"`
+	Synchronizations []SyncJob   `json:"synchronizations"`
 }
 
 func (e *Engine) intakeReportLocked(projectID, repositoryID string) IntakeReport {
 	config := e.intakes[githubKey(projectID, repositoryID)]
-	report := IntakeReport{Enabled: config.Enabled, ReviewBindingID: config.ReviewBindingID, CheckedAt: config.CheckedAt, Error: config.Error, Jobs: []IssueJob{}, Revisions: []ReviewJob{}}
+	report := IntakeReport{
+		Enabled:          config.Enabled,
+		IssueBindingID:   config.IssueBindingID,
+		ReviewBindingID:  config.ReviewBindingID,
+		SyncBindingID:    config.SyncBindingID,
+		CheckedAt:        config.CheckedAt,
+		Error:            config.Error,
+		Jobs:             []IssueJob{},
+		Revisions:        []ReviewJob{},
+		Synchronizations: []SyncJob{},
+	}
 	for _, j := range e.issueJobs {
 		if j.ProjectID == projectID && j.RepositoryID == repositoryID {
 			report.Jobs = append(report.Jobs, j.IssueJob)
@@ -70,6 +86,14 @@ func (e *Engine) intakeReportLocked(projectID, repositoryID string) IntakeReport
 			report.Revisions = append(report.Revisions, j.ReviewJob)
 		}
 	}
+	for _, j := range e.syncJobs {
+		if j.ProjectID == projectID && j.RepositoryID == repositoryID {
+			report.Synchronizations = append(report.Synchronizations, j.SyncJob)
+		}
+	}
+	sort.Slice(report.Synchronizations, func(i, j int) bool {
+		return report.Synchronizations[i].UpdatedAt > report.Synchronizations[j].UpdatedAt
+	})
 	sort.Slice(report.Revisions, func(i, j int) bool { return report.Revisions[i].UpdatedAt > report.Revisions[j].UpdatedAt })
 	sort.Slice(report.Jobs, func(i, j int) bool { return report.Jobs[i].UpdatedAt > report.Jobs[j].UpdatedAt })
 	return report
@@ -95,6 +119,9 @@ func (e *Engine) setRepositoryIntake(projectID, repositoryID string, enabled boo
 	key := githubKey(projectID, repositoryID)
 	config := e.intakes[key]
 	if enabled {
+		if err := e.checkIssueBindingLocked(projectID, repositoryID, config.IssueBindingID); err != nil {
+			return IntakeReport{}, conflict(err.Error())
+		}
 		health := e.github[key]
 		if health.RepositoryPath != repository.Path || health.Connection == nil || !health.Connection.CanPush || health.Connection.Archived || !health.Connection.IssuesEnabled {
 			return IntakeReport{}, conflict("check the GitHub connection with push permission before enabling intake")
@@ -108,19 +135,11 @@ func (e *Engine) setRepositoryIntake(projectID, repositoryID string, enabled boo
 	}
 	config.Enabled = enabled
 	config.ProjectID, config.RepositoryID, config.RepositoryPath = projectID, repositoryID, repository.Path
-	if enabled && config.ReviewBindingID == "" && !config.ReviewDisabled {
-		config, err = e.ensureDefaultReviewBindingLocked(config)
-		if err != nil {
-			e.fatalLocked(err)
-			return IntakeReport{}, err
-		}
-	} else {
-		if err = e.store.save(record{"intake", key, config}); err != nil {
-			e.fatalLocked(err)
-			return IntakeReport{}, err
-		}
-		e.intakes[key] = config
+	if err = e.store.save(record{"intake", key, config}); err != nil {
+		e.fatalLocked(err)
+		return IntakeReport{}, err
 	}
+	e.intakes[key] = config
 	select {
 	case e.intakeWake <- struct{}{}:
 	default:
@@ -144,8 +163,70 @@ func (e *Engine) setReviewBinding(projectID, repositoryID, bindingID string) (In
 	key := githubKey(projectID, repositoryID)
 	config := e.intakes[key]
 	config.ReviewBindingID = bindingID
-	config.ReviewDisabled = bindingID == ""
 	config.ProjectID, config.RepositoryID = projectID, repositoryID
+	if err := e.store.save(record{"intake", key, config}); err != nil {
+		e.fatalLocked(err)
+		return IntakeReport{}, err
+	}
+	e.intakes[key] = config
+	select {
+	case e.intakeWake <- struct{}{}:
+	default:
+	}
+	return e.intakeReportLocked(projectID, repositoryID), nil
+}
+func (e *Engine) setSyncBinding(projectID, repositoryID, bindingID string) (IntakeReport, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.healthyLocked(); err != nil {
+		return IntakeReport{}, err
+	}
+	if _, err := e.repositoryLocked(projectID, repositoryID); err != nil {
+		return IntakeReport{}, err
+	}
+	if bindingID != "" {
+		if err := e.checkSyncBindingLocked(projectID, repositoryID, bindingID); err != nil {
+			return IntakeReport{}, invalid(err)
+		}
+	}
+	key := githubKey(projectID, repositoryID)
+	config := e.intakes[key]
+	config.SyncBindingID = bindingID
+	config.ProjectID, config.RepositoryID = projectID, repositoryID
+	if err := e.store.save(record{"intake", key, config}); err != nil {
+		e.fatalLocked(err)
+		return IntakeReport{}, err
+	}
+	e.intakes[key] = config
+	select {
+	case e.intakeWake <- struct{}{}:
+	default:
+	}
+	return e.intakeReportLocked(projectID, repositoryID), nil
+}
+
+func (e *Engine) setIssueBinding(projectID, repositoryID, bindingID string) (IntakeReport, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.healthyLocked(); err != nil {
+		return IntakeReport{}, err
+	}
+	if _, err := e.repositoryLocked(projectID, repositoryID); err != nil {
+		return IntakeReport{}, err
+	}
+	if bindingID != "" {
+		if err := e.checkIssueBindingLocked(projectID, repositoryID, bindingID); err != nil {
+			return IntakeReport{}, invalid(err)
+		}
+	}
+	key := githubKey(projectID, repositoryID)
+	config := e.intakes[key]
+	config.IssueBindingID = bindingID
+	config.ProjectID, config.RepositoryID = projectID, repositoryID
+	config.Error = ""
+	if config.Enabled && bindingID == "" {
+		config.Error = "select an issue workflow binding before enabling issue work"
+	}
 	if err := e.store.save(record{"intake", key, config}); err != nil {
 		e.fatalLocked(err)
 		return IntakeReport{}, err
@@ -165,13 +246,19 @@ func (e *Engine) checkIntakeProjectUpdateLocked(p Project) error {
 		}
 		retained := config.Enabled
 		for _, j := range e.issueJobs {
-			if j.ProjectID == p.ID && j.RepositoryID == config.RepositoryID && (j.Worktree != "" || j.Status != "closed") {
+			if j.ProjectID == p.ID && j.RepositoryID == config.RepositoryID && (j.Worktree != "" || !issueJobResolved(j.Status)) {
 				retained = true
 				break
 			}
 		}
 		for _, j := range e.reviewJobs {
 			if j.ProjectID == p.ID && j.RepositoryID == config.RepositoryID && (j.Worktree != "" || j.Status != "published") {
+				retained = true
+				break
+			}
+		}
+		for _, j := range e.syncJobs {
+			if j.ProjectID == p.ID && j.RepositoryID == config.RepositoryID && syncJobBlocks(j) {
 				retained = true
 				break
 			}
@@ -205,6 +292,104 @@ func (e *Engine) saveIssueJob(j savedIssueJob) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.saveIssueJobLocked(j)
+}
+
+func issueJobResolved(status string) bool {
+	return status == "closed" || status == "released"
+}
+
+func (e *Engine) releaseRetainedIssueJob(ctx context.Context, projectID, repositoryID, jobID, expectedHeadSHA, expectedBaseSHA string) (IntakeReport, error) {
+	operation, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	stop := context.AfterFunc(e.ctx, cancel)
+	defer stop()
+
+	key := githubKey(projectID, repositoryID)
+	activeKey := "release/" + jobID
+	e.mu.Lock()
+	if err := e.healthyLocked(); err != nil {
+		e.mu.Unlock()
+		return IntakeReport{}, err
+	}
+	if _, err := e.repositoryLocked(projectID, repositoryID); err != nil {
+		e.mu.Unlock()
+		return IntakeReport{}, err
+	}
+	job, ok := e.issueJobs[jobID]
+	if !ok || job.ProjectID != projectID || job.RepositoryID != repositoryID {
+		e.mu.Unlock()
+		return IntakeReport{}, missing("issue job")
+	}
+	if e.issueActive[jobID] {
+		e.mu.Unlock()
+		return IntakeReport{}, conflict("issue job is active")
+	}
+	if job.Status != "failed" && job.Status != "interrupted" && job.Status != "paused" {
+		e.mu.Unlock()
+		return IntakeReport{}, conflict("only a failed, interrupted, or paused issue candidate can be released")
+	}
+	if job.Worktree == "" {
+		e.mu.Unlock()
+		return IntakeReport{}, conflict("issue job does not have a retained workspace")
+	}
+	if job.HeadSHA != "" {
+		if expectedHeadSHA == "" || expectedHeadSHA != job.HeadSHA {
+			e.mu.Unlock()
+			return IntakeReport{}, conflict("retained candidate changed; refresh intake status before releasing it")
+		}
+	} else if expectedBaseSHA == "" || expectedBaseSHA != job.BaseSHA {
+		e.mu.Unlock()
+		return IntakeReport{}, conflict("retained no-change workspace changed; refresh intake status before releasing it")
+	}
+	e.issueActive[jobID] = true
+	e.active[activeKey] = activeExecution{cancel: cancel, projectID: projectID}
+	e.wg.Add(1)
+	e.mu.Unlock()
+
+	released := false
+	defer func() {
+		e.mu.Lock()
+		delete(e.active, activeKey)
+		delete(e.issueActive, jobID)
+		if released {
+			e.dispatchIssueJobsLocked(key)
+		}
+		e.mu.Unlock()
+		e.notify()
+		e.wg.Done()
+	}()
+
+	release, err := acquireIssueLease(job.Repository.Path, job.ID)
+	if err != nil {
+		return IntakeReport{}, conflict(err.Error())
+	}
+	defer release()
+	if job.HeadSHA != "" {
+		err = cleanupIssueWorkspace(operation, e.data, job.Repository.Path, job.ID, job.workspace())
+	} else {
+		err = cleanupNoopIssueWorkspace(operation, e.data, job.Repository.Path, job.ID, job.workspace())
+	}
+	if err != nil {
+		return IntakeReport{}, conflict("retained workspace was not released: " + err.Error())
+	}
+
+	e.mu.Lock()
+	current := e.issueJobs[jobID]
+	if current.Worktree != job.Worktree || current.BaseSHA != job.BaseSHA || current.HeadSHA != job.HeadSHA {
+		e.mu.Unlock()
+		return IntakeReport{}, conflict("retained workspace changed while it was being released")
+	}
+	current.Worktree = ""
+	current.Status = "released"
+	current.Error = ""
+	if err = e.saveIssueJobLocked(current); err != nil {
+		e.mu.Unlock()
+		return IntakeReport{}, err
+	}
+	released = true
+	report := e.intakeReportLocked(projectID, repositoryID)
+	e.mu.Unlock()
+	return report, nil
 }
 func (e *Engine) intakeLoop() {
 	defer e.wg.Done()
@@ -260,15 +445,21 @@ func (e *Engine) pollRepositoryIntake(ctx context.Context, projectID, repository
 	defer stop()
 	var pollErr error
 	if config.Enabled {
+		e.mu.Lock()
+		pollErr = e.checkIssueBindingLocked(projectID, repositoryID, config.IssueBindingID)
+		e.mu.Unlock()
 		var connection GitHubConnection
-		connection, pollErr = verifyIssueRepository(operation, config.RepositoryPath, config.Connection)
+		if pollErr == nil {
+			connection, pollErr = verifyIssueRepository(operation, config.RepositoryPath, config.Connection)
+		}
 		if pollErr == nil {
 			var issues []githubIssue
 			issues, pollErr = fetchIntakeIssues(operation, connection.ID)
 			if pollErr == nil {
 				e.mu.Lock()
 				// A disable during the network request must prevent admission.
-				if e.intakes[key].Enabled {
+				current := e.intakes[key]
+				if current.Enabled && e.checkIssueBindingLocked(projectID, repositoryID, current.IssueBindingID) == nil {
 					for _, issue := range issues {
 						duplicate := false
 						for _, j := range e.issueJobs {
@@ -283,9 +474,12 @@ func (e *Engine) pollRepositoryIntake(ctx context.Context, projectID, repository
 						p := copyJSON(e.projects[projectID])
 						repo, _ := e.repositoryLocked(projectID, repositoryID)
 						j := savedIssueJob{IssueJob: IssueJob{ID: uuid.NewString(), ProjectID: projectID, RepositoryID: repositoryID, GitHubRepositoryID: connection.ID, Number: issue.Number, Title: issue.Title, URL: issue.URL, Status: "queued"}, Project: p, Repository: repo, Connection: connection, Body: issue.Body, BaseBranch: connection.DefaultBranch}
-						if err := issueAuthorization(issue); err != nil {
+						binding, workflow, selectionErr := e.selectIssueBindingLocked(current, issue)
+						if selectionErr != nil {
 							j.Status = "paused"
-							j.Error = err.Error()
+							j.Error = selectionErr.Error()
+						} else {
+							j.Binding, j.Workflow = binding, workflow
 						}
 						if err := e.saveIssueJobLocked(j); err != nil {
 							pollErr = err
@@ -323,6 +517,11 @@ func (e *Engine) pollRepositoryIntake(ctx context.Context, projectID, repository
 			pollErr = err
 		}
 	}
+	if pollErr == nil && config.Enabled && config.SyncBindingID != "" {
+		if err := e.pollSyncJobs(operation, config); err != nil {
+			pollErr = err
+		}
+	}
 	e.mu.Lock()
 	latest := e.intakes[key]
 	latest.CheckedAt = now()
@@ -352,6 +551,9 @@ func (e *Engine) dispatchIssueJobsLocked(key string) {
 		if j.Status != "queued" && j.Status != "paused" && j.Status != "publishing" {
 			continue
 		}
+		if j.Binding.ID == "" || len(j.Workflow.Nodes) != 1 {
+			continue
+		}
 		blocked := false
 		for _, other := range jobs {
 			if other.ID == j.ID {
@@ -366,6 +568,12 @@ func (e *Engine) dispatchIssueJobsLocked(key string) {
 		}
 		for _, revision := range e.reviewJobs {
 			if revision.Issue.GitHubRepositoryID == j.GitHubRepositoryID && (e.issueActive[revision.IssueJobID] || (revision.Worktree != "" && revision.Status != "published")) {
+				blocked = true
+				break
+			}
+		}
+		for _, synchronization := range e.syncJobs {
+			if synchronization.Issue.GitHubRepositoryID == j.GitHubRepositoryID && (e.issueActive[synchronization.IssueJobID] || (synchronization.Worktree != "" && !syncJobResolved(synchronization.Status))) {
 				blocked = true
 				break
 			}
@@ -401,11 +609,18 @@ func (e *Engine) issueAdmission(ctx context.Context, j savedIssueJob) error {
 		return err
 	}
 	e.mu.Lock()
-	enabled := e.intakes[githubKey(j.ProjectID, j.RepositoryID)].Enabled
+	config := e.intakes[githubKey(j.ProjectID, j.RepositoryID)]
+	configErr := e.checkIssueBindingLocked(j.ProjectID, j.RepositoryID, config.IssueBindingID)
 	cancelled := j.RunID != "" && e.runs[j.RunID].Run.Status == "cancelled"
 	e.mu.Unlock()
-	if !enabled {
+	if !config.Enabled {
 		return fmt.Errorf("repository intake is disabled")
+	}
+	if configErr != nil {
+		return configErr
+	}
+	if j.Binding.ID == "" || len(j.Workflow.Nodes) != 1 {
+		return fmt.Errorf("issue job has no configured workflow snapshot; intervention required")
 	}
 	if cancelled {
 		return fmt.Errorf("run was cancelled; candidate retained for intervention")
@@ -427,8 +642,14 @@ func (e *Engine) authorizeIssue(ctx context.Context, j *savedIssueJob) error {
 	if err != nil {
 		return err
 	}
-	if err = issueAuthorization(issue); err != nil {
-		return err
+	e.mu.Lock()
+	binding, _, selectionErr := e.selectIssueBindingLocked(e.intakes[githubKey(j.ProjectID, j.RepositoryID)], issue)
+	e.mu.Unlock()
+	if selectionErr != nil {
+		return selectionErr
+	}
+	if binding.ID != j.Binding.ID {
+		return fmt.Errorf("issue workflow selection changed; candidate retained for intervention")
 	}
 	if j.RunID != "" && (issue.Title != j.Title || issue.Body != j.Body) {
 		return fmt.Errorf("issue changed since execution; candidate retained for intervention")
@@ -513,7 +734,7 @@ func (e *Engine) workIssue(ctx context.Context, j savedIssueJob) {
 		}
 	}
 	e.mu.Lock()
-	runStatus := e.runs[j.RunID].Run.Nodes["implement"].Status
+	runStatus := e.runs[j.RunID].Run.Nodes[j.Workflow.Nodes[0].ID].Status
 	e.mu.Unlock()
 	if runStatus != "succeeded" {
 		fail("failed", fmt.Errorf("implementation run ended %s; publication blocked", runStatus))

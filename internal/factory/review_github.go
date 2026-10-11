@@ -127,86 +127,137 @@ func fetchReviewFeedback(ctx context.Context, repoID int64, prNumber int, source
 	return feedback, nil
 }
 
-func authorizeReviewPR(ctx context.Context, j savedIssueJob) (issuePullRequest, error) {
-	return inspectReviewPR(ctx, j, true)
+func authorizeReviewPR(ctx context.Context, job savedIssueJob) (issuePullRequest, error) {
+	return inspectManagedPR(ctx, job, "review")
 }
 
-func inspectReviewPR(ctx context.Context, j savedIssueJob, requireReview bool) (issuePullRequest, error) {
-	if j.GitHubRepositoryID <= 0 || j.Connection.ID != j.GitHubRepositoryID || j.PullRequestNumber <= 0 || j.Branch == "" {
+func authorizeSyncPR(ctx context.Context, job savedIssueJob) (issuePullRequest, error) {
+	return inspectManagedPR(ctx, job, "sync")
+}
+
+func inspectReviewPR(ctx context.Context, job savedIssueJob, requireReview bool) (issuePullRequest, error) {
+	required := ""
+	if requireReview {
+		required = "review"
+	}
+	return inspectManagedPR(ctx, job, required)
+}
+
+func inspectManagedPR(ctx context.Context, job savedIssueJob, requiredWorkflow string) (issuePullRequest, error) {
+	if job.GitHubRepositoryID <= 0 || job.Connection.ID != job.GitHubRepositoryID || job.PullRequestNumber <= 0 || job.Branch == "" {
 		return issuePullRequest{}, fmt.Errorf("missing recorded Factory pull request ownership")
 	}
-	if _, err := verifyIssueRepository(ctx, j.Repository.Path, j.Connection); err != nil {
+	if _, err := verifyIssueRepository(ctx, job.Repository.Path, job.Connection); err != nil {
 		return issuePullRequest{}, err
 	}
-	pr, err := findIssuePR(ctx, j)
+	pr, err := findIssuePR(ctx, job)
 	if err != nil {
 		return issuePullRequest{}, err
 	}
-	if pr == nil || pr.State != "open" || !validReviewHeadSHA(pr.Head.SHA) || pr.Base.Ref != j.BaseBranch {
+	if pr == nil || pr.State != "open" || !validReviewHeadSHA(pr.Head.SHA) || pr.Base.Ref != job.BaseBranch {
 		return issuePullRequest{}, fmt.Errorf("Factory pull request is not open on its recorded base with a valid head commit")
 	}
-	issue, err := fetchIntakeIssue(ctx, j.GitHubRepositoryID, j.PullRequestNumber)
+	issue, err := fetchIntakeIssue(ctx, job.GitHubRepositoryID, job.PullRequestNumber)
 	if err != nil {
 		return issuePullRequest{}, err
 	}
-	if _, err := reviewLabels(issue, requireReview); err != nil {
+	if _, err := prAutomationLabels(issue, requiredWorkflow); err != nil {
 		return issuePullRequest{}, err
 	}
 	return *pr, nil
 }
 
-func reviewLabels(issue githubIssue, requireReview bool) (bool, error) {
+type prAutomationSelection struct {
+	Review bool
+	Sync   bool
+}
+
+func prAutomationLabels(issue githubIssue, requiredWorkflow string) (prAutomationSelection, error) {
+	var selection prAutomationSelection
 	if len(issue.PullRequest) == 0 || string(issue.PullRequest) == "null" || issue.State != "open" {
-		return false, fmt.Errorf("Factory pull request issue is not open")
+		return selection, fmt.Errorf("Factory pull request issue is not open")
 	}
-	run, review, modes := false, false, 0
+	run, modes := false, 0
 	for _, label := range issue.Labels {
 		name := strings.ToLower(label.Name)
 		switch {
 		case name == "agent:run":
 			run = true
 		case name == "agent/workflow:review":
-			review = true
+			selection.Review = true
+		case name == "agent/workflow:sync":
+			selection.Sync = true
 		case strings.HasPrefix(name, "agent/workflow:"):
-			return false, fmt.Errorf("conflicting pull request workflow labels")
+			return selection, fmt.Errorf("conflicting pull request workflow labels")
 		case strings.HasPrefix(name, "agent/mode:"):
 			modes++
 			if name != "agent/mode:repair" {
-				return false, fmt.Errorf("unsupported pull request review mode")
+				return selection, fmt.Errorf("unsupported pull request automation mode")
 			}
 		}
 	}
-	if !run || requireReview && !review || modes > 1 {
-		return false, fmt.Errorf("pull request review authorization is absent or conflicting")
+	selected := requiredWorkflow == "" || requiredWorkflow == "review" && selection.Review || requiredWorkflow == "sync" && selection.Sync
+	if !run || !selected || modes > 1 {
+		return selection, fmt.Errorf("pull request automation authorization is absent or conflicting")
 	}
-	return review, nil
+	return selection, nil
 }
 
-// A trusted review selects its workflow; only agent:run can authorize code
-// changes. Never add a selector to an unowned, unauthorized, or conflicting PR.
-func ensureReviewWorkflowLabel(ctx context.Context, j savedIssueJob) error {
-	issue, err := fetchIntakeIssue(ctx, j.GitHubRepositoryID, j.PullRequestNumber)
+func reviewLabels(issue githubIssue, requireReview bool) (bool, error) {
+	required := ""
+	if requireReview {
+		required = "review"
+	}
+	selection, err := prAutomationLabels(issue, required)
+	return selection.Review, err
+}
+
+func syncLabels(issue githubIssue, requireSync bool) (bool, error) {
+	required := ""
+	if requireSync {
+		required = "sync"
+	}
+	selection, err := prAutomationLabels(issue, required)
+	return selection.Sync, err
+}
+
+// A configured managed workflow selects its own marker. Only agent:run can
+// authorize code changes. Never add a selector to an unowned or unauthorized PR.
+func ensureReviewWorkflowLabel(ctx context.Context, job savedIssueJob) error {
+	return ensurePRWorkflowLabel(ctx, job, "review")
+}
+
+func ensureSyncWorkflowLabel(ctx context.Context, job savedIssueJob) error {
+	return ensurePRWorkflowLabel(ctx, job, "sync")
+}
+
+func ensurePRWorkflowLabel(ctx context.Context, job savedIssueJob, workflow string) error {
+	issue, err := fetchIntakeIssue(ctx, job.GitHubRepositoryID, job.PullRequestNumber)
 	if err != nil {
 		return err
 	}
-	selected, err := reviewLabels(issue, false)
-	if err != nil || selected {
+	selection, err := prAutomationLabels(issue, "")
+	if err != nil {
 		return err
 	}
-	data, err := gitHubAPI(ctx, "POST", fmt.Sprintf("repositories/%d/issues/%d/labels", j.GitHubRepositoryID, j.PullRequestNumber), "-f", "labels[]=agent/workflow:review")
+	if workflow == "review" && selection.Review || workflow == "sync" && selection.Sync {
+		return nil
+	}
+	label := "agent/workflow:" + workflow
+	data, err := gitHubAPI(ctx, "POST", fmt.Sprintf("repositories/%d/issues/%d/labels", job.GitHubRepositoryID, job.PullRequestNumber), "-f", "labels[]="+label)
 	if err != nil {
 		return err
 	}
 	var labels []gitHubLabelResponse
 	if err := json.Unmarshal(data, &labels); err != nil {
-		return fmt.Errorf("invalid GitHub review label response: %w", err)
+		return fmt.Errorf("invalid GitHub %s label response: %w", workflow, err)
 	}
-	for _, label := range labels {
-		if strings.EqualFold(label.Name, "agent/workflow:review") {
+	for _, observed := range labels {
+		if strings.EqualFold(observed.Name, label) {
 			return nil
 		}
 	}
-	return fmt.Errorf("GitHub did not confirm the review workflow label")
+	return fmt.Errorf("GitHub did not confirm the %s workflow label", workflow)
 }
 
 func validReviewHeadSHA(value string) bool {

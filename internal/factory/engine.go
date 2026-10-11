@@ -47,6 +47,7 @@ type Engine struct {
 	intakes     map[string]intakeConfig
 	issueJobs   map[string]savedIssueJob
 	reviewJobs  map[string]savedReviewJob
+	syncJobs    map[string]savedSyncJob
 	intakeBusy  map[string]bool
 	issueActive map[string]bool
 	intakeWake  chan struct{}
@@ -113,12 +114,8 @@ func Open(data string) (*Engine, error) {
 	if e.reviewJobs, err = loadRecords[savedReviewJob](s, "review-job"); err != nil {
 		return fail(err)
 	}
-	for _, config := range e.intakes {
-		if config.Enabled && config.ReviewBindingID == "" && !config.ReviewDisabled {
-			if _, err := e.ensureDefaultReviewBindingLocked(config); err != nil {
-				return fail(err)
-			}
-		}
+	if e.syncJobs, err = loadRecords[savedSyncJob](s, "sync-job"); err != nil {
+		return fail(err)
 	}
 	e.intakeBusy = make(map[string]bool)
 	e.issueActive = make(map[string]bool)
@@ -163,13 +160,18 @@ func Open(data string) (*Engine, error) {
 		if job.Status == "working" {
 			job.Status = "interrupted"
 			job.Error = "Daemon stopped during local execution; workspace retained. Inspect local work and any surviving processes before recovery."
-			job.UpdatedAt = now()
-			if err := s.save(record{"issue-job", id, job}); err != nil {
-				e.stop()
-				return fail(err)
-			}
-			e.issueJobs[id] = job
+		} else if (job.Status == "queued" || job.Status == "paused" || job.Status == "publishing") && (job.Binding.ID == "" || len(job.Workflow.Nodes) != 1) {
+			job.Status = "paused"
+			job.Error = "Issue job has no configured workflow snapshot; automatic execution and publication are blocked. Inspect retained work before recovery."
+		} else {
+			continue
 		}
+		job.UpdatedAt = now()
+		if err := s.save(record{"issue-job", id, job}); err != nil {
+			e.stop()
+			return fail(err)
+		}
+		e.issueJobs[id] = job
 	}
 	for id, job := range e.reviewJobs {
 		if job.Status == "queued" || job.Status == "working" || job.Status == "publishing" {
@@ -181,6 +183,18 @@ func Open(data string) (*Engine, error) {
 				return fail(err)
 			}
 			e.reviewJobs[id] = job
+		}
+	}
+	for id, job := range e.syncJobs {
+		if job.Status == "queued" || job.Status == "working" || job.Status == "publishing" {
+			job.Status = "interrupted"
+			job.Error = "Daemon stopped during PR synchronization admission, execution, or publication; inspect the PR head and retained worktree before recovery."
+			job.UpdatedAt = now()
+			if err := s.save(record{"sync-job", id, job}); err != nil {
+				e.stop()
+				return fail(err)
+			}
+			e.syncJobs[id] = job
 		}
 	}
 	e.wg.Add(1)

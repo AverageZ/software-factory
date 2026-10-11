@@ -75,7 +75,7 @@ func TestCancellingRevisionStopsPublicationContext(t *testing.T) {
 	}
 }
 
-func TestEnabledIntakeSeedsEditableReviewWorkflowOnce(t *testing.T) {
+func TestEnabledIntakeDoesNotCreateWorkflowsOnRestart(t *testing.T) {
 	fixture := newWorkspaceFixture(t)
 	store, err := openStore(fixture.data)
 	if err != nil {
@@ -93,11 +93,11 @@ func TestEnabledIntakeSeedsEditableReviewWorkflowOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bindingID := engine.intakes[githubKey(project.ID, "repo")].ReviewBindingID
-	binding := engine.bindings[bindingID]
-	workflow := engine.workflows[binding.WorkflowID]
-	if bindingID == "" || workflow.ID == "" || workflow.Nodes[0].Config["feedbackSources"] == nil {
-		t.Fatalf("enabled intake has no editable review workflow: %+v", binding)
+	if len(engine.workflows) != 0 || len(engine.bindings) != 0 {
+		t.Fatal("startup created workflows or bindings")
+	}
+	if c := engine.intakes[githubKey(project.ID, "repo")]; c.IssueBindingID != "" || c.ReviewBindingID != "" || c.SyncBindingID != "" {
+		t.Fatalf("startup selected an implicit workflow: %+v", c)
 	}
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
@@ -106,8 +106,8 @@ func TestEnabledIntakeSeedsEditableReviewWorkflowOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if engine.intakes[githubKey(project.ID, "repo")].ReviewBindingID != bindingID || len(engine.workflows) != 1 {
-		t.Fatal("restart recreated or lost the review workflow")
+	if len(engine.workflows) != 0 || len(engine.bindings) != 0 {
+		t.Fatal("restart created workflows or bindings")
 	}
 	if _, err := engine.setReviewBinding(project.ID, "repo", ""); err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestEnabledIntakeSeedsEditableReviewWorkflowOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	if c := engine.intakes[githubKey(project.ID, "repo")]; c.ReviewBindingID != "" || !c.ReviewDisabled {
+	if c := engine.intakes[githubKey(project.ID, "repo")]; c.ReviewBindingID != "" || c.IssueBindingID != "" || c.SyncBindingID != "" {
 		t.Fatalf("explicit review opt-out was lost on restart: %+v", c)
 	}
 }

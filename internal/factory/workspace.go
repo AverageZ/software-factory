@@ -22,13 +22,15 @@ type issueWorkspace struct {
 	HeadSHA string
 }
 
-// Ownership lives with the repository, not the daemon data directory. In
-// particular, an abandoned, uncheckpointed worktree must block other daemons.
-// Records and branches survive cleanup as durable evidence of ownership.
+// Ownership lives with the repository, not the daemon data directory. An
+// uncertain uncheckpointed worktree blocks other daemons. A worker marks its
+// stopped worktree retained so unrelated isolated jobs can continue. Records
+// and branches survive cleanup as durable evidence of ownership.
 type issueWorkspaceOwner struct {
 	issueWorkspace
 	CommonDir string
 	GitDir    string
+	Retained  bool
 }
 
 type issueWorktreeEntry struct {
@@ -272,7 +274,7 @@ func issueCheckAbandoned(ctx context.Context, repositoryPath, common, jobID stri
 		if err != nil {
 			return err
 		}
-		if id == jobID || owner.HeadSHA != "" {
+		if id == jobID || owner.HeadSHA != "" || owner.Retained {
 			continue
 		}
 		_, err = os.Lstat(owner.Path)
@@ -288,29 +290,26 @@ func issueCheckAbandoned(ctx context.Context, repositoryPath, common, jobID stri
 	return nil
 }
 
-func acquireIssueLease(repositoryPath, jobID string) (func(), error) {
-	if !validIssueJobID(jobID) {
-		return nil, errors.New("invalid issue workspace job ID")
-	}
+func acquireRepositoryLease(repositoryPath string) (func(), string, error) {
 	ctx := context.Background()
 	common, err := issueRepositoryCommonDir(ctx, repositoryPath)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	path := filepath.Join(common, "factory-issue.lock")
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("open repository lease: %w", err)
+		return nil, "", fmt.Errorf("open repository lease: %w", err)
 	}
 	file := os.NewFile(uintptr(fd), path)
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		file.Close()
-		return nil, errors.New("repository lease is not a regular file")
+		return nil, "", errors.New("repository lease is not a regular file")
 	}
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
-		return nil, fmt.Errorf("repository is leased by another issue worker: %w", err)
+		return nil, "", fmt.Errorf("repository is leased by another issue worker: %w", err)
 	}
 	var once sync.Once
 	release := func() {
@@ -319,7 +318,18 @@ func acquireIssueLease(repositoryPath, jobID string) (func(), error) {
 			_ = file.Close()
 		})
 	}
-	if err := issueCheckAbandoned(ctx, repositoryPath, common, jobID); err != nil {
+	return release, common, nil
+}
+
+func acquireIssueLease(repositoryPath, jobID string) (func(), error) {
+	if !validIssueJobID(jobID) {
+		return nil, errors.New("invalid issue workspace job ID")
+	}
+	release, common, err := acquireRepositoryLease(repositoryPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := issueCheckAbandoned(context.Background(), repositoryPath, common, jobID); err != nil {
 		release()
 		return nil, err
 	}
@@ -629,6 +639,78 @@ func issueRejectLFSCandidate(ctx context.Context, path, base string) error {
 	}
 	return nil
 }
+func prepareSyncMerge(ctx context.Context, repositoryPath string, w issueWorkspace, remoteURL, baseBranch, expectedBaseSHA string) (bool, error) {
+	owner, err := issueValidateWorkspace(ctx, repositoryPath, w, false)
+	if err != nil {
+		return false, err
+	}
+	if w.HeadSHA != "" || owner.HeadSHA != "" {
+		return false, errors.New("synchronization workspace already has a checkpoint")
+	}
+	if !issueObjectID(expectedBaseSHA) {
+		return false, errors.New("invalid synchronization base commit")
+	}
+	if err := issueCheckRemote(ctx, repositoryPath, remoteURL); err != nil {
+		return false, err
+	}
+	if _, err := issueGit(ctx, repositoryPath, "check-ref-format", "refs/heads/"+baseBranch); err != nil {
+		return false, errors.New("invalid synchronization base branch")
+	}
+	jobID := strings.TrimPrefix(w.Branch, "factory/issue-")
+	targetRef := "refs/factory/sync-bases/" + jobID
+	if _, err := issueGit(ctx, repositoryPath, "show-ref", "--verify", "--quiet", targetRef); !issueGitExit(err, 1) {
+		return false, errors.New("synchronization base ref already exists or cannot be inspected")
+	}
+	if _, err := issueGit(ctx, repositoryPath, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--", remoteURL, "refs/heads/"+baseBranch+":"+targetRef); err != nil {
+		return false, err
+	}
+	targetSHA, err := issueGitText(ctx, repositoryPath, "rev-parse", "--verify", targetRef+"^{commit}")
+	if err != nil || targetSHA != expectedBaseSHA {
+		return false, fmt.Errorf("%w: fetched base branch changed", errSyncStale)
+	}
+	if _, err := issueGit(ctx, w.Path, "merge-base", "--is-ancestor", expectedBaseSHA, w.BaseSHA); err == nil {
+		return false, fmt.Errorf("%w: PR head already contains the current base", errSyncStale)
+	} else if !issueGitExit(err, 1) {
+		return false, err
+	}
+	_, mergeErr := issueGit(ctx, w.Path, "merge", "--no-commit", "--no-ff", "--no-edit", targetRef)
+	if mergeErr == nil {
+		return false, requirePendingSyncMerge(ctx, w, expectedBaseSHA)
+	}
+	mergeHead, headErr := issueGitText(ctx, w.Path, "rev-parse", "--verify", "MERGE_HEAD^{commit}")
+	unmerged, unmergedErr := issueGit(ctx, w.Path, "ls-files", "--unmerged", "-z")
+	if headErr != nil || mergeHead != expectedBaseSHA || unmergedErr != nil || len(unmerged) == 0 {
+		return false, mergeErr
+	}
+	return true, nil
+}
+
+func requirePendingSyncMerge(ctx context.Context, w issueWorkspace, expectedBaseSHA string) error {
+	head, err := issueGitText(ctx, w.Path, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || head != w.BaseSHA {
+		return errors.New("synchronization workspace HEAD changed before checkpointing")
+	}
+	mergeHead, err := issueGitText(ctx, w.Path, "rev-parse", "--verify", "MERGE_HEAD^{commit}")
+	if err != nil || mergeHead != expectedBaseSHA {
+		return errors.New("synchronization merge state changed before checkpointing")
+	}
+	return nil
+}
+
+func requireSyncCandidate(ctx context.Context, w issueWorkspace, expectedBaseSHA string) error {
+	if err := issueRequireCandidate(ctx, w.Path, w); err != nil {
+		return err
+	}
+	parents, err := issueGitText(ctx, w.Path, "show", "-s", "--format=%P", w.HeadSHA)
+	if err != nil {
+		return err
+	}
+	fields := strings.Fields(parents)
+	if len(fields) != 2 || fields[0] != w.BaseSHA || fields[1] != expectedBaseSHA {
+		return errors.New("synchronization checkpoint is not the expected two-parent merge")
+	}
+	return nil
+}
 
 func checkpointIssueWorkspace(ctx context.Context, repositoryPath string, w issueWorkspace, message string) (issueWorkspace, error) {
 	owner, err := issueValidateWorkspace(ctx, repositoryPath, w, false)
@@ -708,6 +790,8 @@ func pushIssueWorkspace(ctx context.Context, repositoryPath string, w issueWorks
 	return err
 }
 
+var errReviewHeadChanged = errors.New("PR branch changed during revision; refusing to overwrite it")
+
 // A revision advances only the PR head observed at admission. The explicit
 // lease is enforced by the remote even if another writer races the preflight.
 func pushReviewWorkspace(ctx context.Context, repositoryPath string, w issueWorkspace, remoteURL, branch, expected string) error {
@@ -733,13 +817,65 @@ func pushReviewWorkspace(ctx context.Context, repositoryPath string, w issueWork
 		return err
 	}
 	if output != expected+"\t"+ref {
-		return errors.New("PR branch changed during revision; refusing to overwrite it")
+		return errReviewHeadChanged
 	}
 	_, err = issueGit(ctx, repositoryPath, "-c", "push.followTags=false", "push", "--porcelain", "--no-verify", "--recurse-submodules=no", "--force-with-lease="+ref+":"+expected, "--", remoteURL, w.HeadSHA+":"+ref)
 	return err
 }
 
-func cleanupIssueWorkspace(ctx context.Context, data, repositoryPath, jobID string, w issueWorkspace) error {
+func retainIssueWorkspace(ctx context.Context, repositoryPath string, w issueWorkspace) error {
+	owner, err := issueValidateWorkspace(ctx, repositoryPath, w, false)
+	if err != nil {
+		return err
+	}
+	owner.Retained = true
+	jobID := strings.TrimPrefix(w.Branch, "factory/issue-")
+	return issueWriteOwner(owner.CommonDir, jobID, owner, false)
+}
+
+func discardIssueWorkspace(ctx context.Context, data, repositoryPath, jobID string, w issueWorkspace) error {
+	if err := issueValidateCleanupTarget(data, jobID, w); err != nil {
+		return err
+	}
+	owner, err := issueValidateWorkspace(ctx, repositoryPath, w, true)
+	if err != nil {
+		return err
+	}
+	if owner.HeadSHA != w.HeadSHA {
+		return errors.New("workspace checkpoint does not match its durable ownership record")
+	}
+	registered := false
+	entries, err := issueWorktrees(ctx, repositoryPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Path == w.Path {
+			registered = true
+			break
+		}
+	}
+	if _, err := os.Lstat(w.Path); err == nil || registered {
+		if _, err := issueGit(ctx, repositoryPath, "worktree", "remove", "--force", "--", w.Path); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	entries, err = issueWorktrees(ctx, repositoryPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Path == w.Path {
+			return errors.New("discarded workspace remains registered")
+		}
+	}
+	owner.Retained = true
+	return issueWriteOwner(owner.CommonDir, jobID, owner, false)
+}
+
+func issueValidateCleanupTarget(data, jobID string, w issueWorkspace) error {
 	if !validIssueJobID(jobID) || w.Branch != "factory/issue-"+jobID {
 		return errors.New("invalid issue cleanup ownership")
 	}
@@ -749,6 +885,13 @@ func cleanupIssueWorkspace(ctx context.Context, data, repositoryPath, jobID stri
 	}
 	if w.Path != filepath.Join(root, "worktrees", jobID) {
 		return errors.New("refusing cleanup outside the owned issue workspace")
+	}
+	return nil
+}
+
+func cleanupIssueWorkspace(ctx context.Context, data, repositoryPath, jobID string, w issueWorkspace) error {
+	if err := issueValidateCleanupTarget(data, jobID, w); err != nil {
+		return err
 	}
 	owner, err := issueValidateWorkspace(ctx, repositoryPath, w, true)
 	if err != nil {
@@ -761,6 +904,36 @@ func cleanupIssueWorkspace(ctx context.Context, data, repositoryPath, jobID stri
 	if err != nil || branchHead != w.HeadSHA {
 		return errors.New("issue branch no longer preserves its checkpoint")
 	}
+	return removeIssueWorkspace(ctx, repositoryPath, w, func() error {
+		return issueRequireCandidate(ctx, w.Path, w)
+	})
+}
+
+func cleanupNoopIssueWorkspace(ctx context.Context, data, repositoryPath, jobID string, w issueWorkspace) error {
+	if err := issueValidateCleanupTarget(data, jobID, w); err != nil {
+		return err
+	}
+	owner, err := issueValidateWorkspace(ctx, repositoryPath, w, true)
+	if err != nil {
+		return err
+	}
+	if w.HeadSHA != "" || owner.HeadSHA != "" {
+		return errors.New("refusing no-change cleanup of a checkpointed issue workspace")
+	}
+	branchHead, err := issueGitText(ctx, repositoryPath, "rev-parse", "--verify", "refs/heads/"+w.Branch+"^{commit}")
+	if err != nil || branchHead != w.BaseSHA {
+		return errors.New("issue branch no longer matches its recorded base")
+	}
+	return removeIssueWorkspace(ctx, repositoryPath, w, func() error {
+		head, err := issueGitText(ctx, w.Path, "rev-parse", "--verify", "HEAD^{commit}")
+		if err != nil || head != w.BaseSHA {
+			return errors.New("issue workspace no longer matches its recorded base")
+		}
+		return issueRequireClean(ctx, w.Path)
+	})
+}
+
+func removeIssueWorkspace(ctx context.Context, repositoryPath string, w issueWorkspace, verify func() error) error {
 	if _, err := os.Lstat(w.Path); errors.Is(err, os.ErrNotExist) {
 		entries, err := issueWorktrees(ctx, repositoryPath)
 		if err != nil {
@@ -774,7 +947,7 @@ func cleanupIssueWorkspace(ctx context.Context, data, repositoryPath, jobID stri
 		}
 		return nil
 	}
-	if err := issueRequireCandidate(ctx, w.Path, w); err != nil {
+	if err := verify(); err != nil {
 		return err
 	}
 	if _, err := issueGit(ctx, repositoryPath, "worktree", "remove", "--", w.Path); err == nil {
@@ -782,11 +955,11 @@ func cleanupIssueWorkspace(ctx context.Context, data, repositoryPath, jobID stri
 	}
 	// Git versions differ on whether ignored build outputs block removal.
 	// Force is permitted only for observed ignored files in the exact owned
-	// checkout after another complete ownership and clean-checkpoint check.
+	// checkout after another complete ownership and clean-state check.
 	if _, err := issueValidateWorkspace(ctx, repositoryPath, w, false); err != nil {
 		return err
 	}
-	if err := issueRequireCandidate(ctx, w.Path, w); err != nil {
+	if err := verify(); err != nil {
 		return err
 	}
 	ignored, err := issueGit(ctx, w.Path, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")

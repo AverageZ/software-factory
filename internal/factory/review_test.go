@@ -125,6 +125,10 @@ printf 'validated revision\n'
 	e.bindings[b.ID] = b
 	c := GitHubConnection{ID: 123, Owner: "owner", Name: "repo", DefaultBranch: "main", CanPush: true}
 	config := intakeConfig{Enabled: true, ProjectID: "p", RepositoryID: "r", RepositoryPath: f.repository, Connection: c, ReviewBindingID: b.ID}
+	issueWorkflow, issueBinding := issueBindingFixture("p", "r", "issue-binding", "Configured issue work")
+	e.workflows[issueWorkflow.ID] = issueWorkflow
+	e.bindings[issueBinding.ID] = issueBinding
+	config.IssueBindingID = issueBinding.ID
 	e.intakes[githubKey("p", "r")] = config
 	issue := savedIssueJob{IssueJob: IssueJob{ID: "original", ProjectID: "p", RepositoryID: "r", GitHubRepositoryID: 123, Number: 5, Status: "published", Branch: w.Branch, HeadSHA: original, PullRequestNumber: 42, PullRequestURL: "https://github.com/owner/repo/pull/42"}, Repository: p.Repositories[0], Project: p, Connection: c, BaseBranch: "main"}
 	e.issueJobs[issue.ID] = issue

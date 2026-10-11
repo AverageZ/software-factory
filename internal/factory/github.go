@@ -62,12 +62,9 @@ type GitHubTarget struct {
 func gitHubLabelCatalog() []GitHubLabel {
 	return []GitHubLabel{
 		{Name: "agent:run", Group: "authorization", Color: "0e8a16", Description: "Authorize Factory activity for this issue or pull request."},
-		{Name: "agent/workflow:bug", Group: "workflow", Color: "1d76db", Description: "Select the Factory bug investigation and repair workflow."},
-		{Name: "agent/workflow:review", Group: "workflow", Color: "1d76db", Description: "Select the Factory pull request review workflow."},
-		{Name: "agent/workflow:rollback", Group: "workflow", Color: "1d76db", Description: "Select the Factory rollback workflow."},
-		{Name: "agent/mode:observe", Group: "mode", Color: "5319e7", Description: "Observe and report without changing code."},
-		{Name: "agent/mode:repair", Group: "mode", Color: "5319e7", Description: "Allow Factory to propose corrective code changes."},
-		{Name: "agent/mode:manage", Group: "mode", Color: "5319e7", Description: "Allow Factory management actions subject to approval gates."},
+		{Name: "agent/workflow:review", Group: "workflow", Color: "1d76db", Description: "Select the configured PR revision binding; does not create a workflow."},
+		{Name: "agent/workflow:sync", Group: "workflow", Color: "1d76db", Description: "Monitor Factory PRs and synchronize their branches with the configured base."},
+		{Name: "agent/mode:repair", Group: "mode", Color: "5319e7", Description: "Permit managed code-change publication; does not select a workflow."},
 		{Name: "agent/status:queued", Group: "status", Color: "fbca04", Description: "Factory work is waiting to start."},
 		{Name: "agent/status:active", Group: "status", Color: "fbca04", Description: "Factory work is in progress."},
 		{Name: "agent/status:paused", Group: "status", Color: "fbca04", Description: "Factory work is paused."},

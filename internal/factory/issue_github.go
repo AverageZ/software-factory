@@ -18,8 +18,8 @@ type githubIssue struct {
 	PullRequest json.RawMessage       `json:"pull_request"`
 }
 
-// Authorization is independent of projected status/phase labels. An ordinary
-// labeled issue selects repair; unsupported or conflicting selectors fail closed.
+// Authorization is independent of projected status/phase labels. Workflow
+// selection is checked separately against the repository's configured bindings.
 func issueAuthorization(issue githubIssue) error {
 	if len(issue.PullRequest) != 0 && string(issue.PullRequest) != "null" {
 		return fmt.Errorf("pull requests are not issue intake subjects")
@@ -43,11 +43,11 @@ func issueAuthorization(issue githubIssue) error {
 	if !authorized {
 		return fmt.Errorf("agent:run authorization is absent")
 	}
-	if len(workflows) > 1 || (len(workflows) == 1 && workflows[0] != "agent/workflow:bug") {
-		return fmt.Errorf("unsupported or conflicting workflow labels; issue intake supports the default repair workflow or agent/workflow:bug")
+	if len(workflows) > 1 || (len(workflows) == 1 && workflows[0] == "agent/workflow:") {
+		return fmt.Errorf("empty or conflicting workflow labels")
 	}
 	if len(modes) > 1 || (len(modes) == 1 && modes[0] != "agent/mode:repair") {
-		return fmt.Errorf("unsupported or conflicting mode labels; issue publication requires default repair mode or agent/mode:repair")
+		return fmt.Errorf("unsupported or conflicting mode labels; managed publication permits agent/mode:repair or no mode label")
 	}
 	return nil
 }

@@ -140,6 +140,21 @@ func (e *Engine) Handler(web string, allowPublic bool) http.Handler {
 		}
 		writeJSON(w, 200, result)
 	})
+	mux.HandleFunc("PUT /api/projects/{projectId}/repositories/{repoId}/intake/issue", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			BindingID string `json:"bindingId"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := e.setIssueBinding(r.PathValue("projectId"), r.PathValue("repoId"), body.BindingID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, result)
+	})
 	mux.HandleFunc("PUT /api/projects/{projectId}/repositories/{repoId}/intake/review", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			BindingID string `json:"bindingId"`
@@ -155,8 +170,74 @@ func (e *Engine) Handler(web string, allowPublic bool) http.Handler {
 		}
 		writeJSON(w, 200, result)
 	})
+	mux.HandleFunc("PUT /api/projects/{projectId}/repositories/{repoId}/intake/sync", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			BindingID string `json:"bindingId"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := e.setSyncBinding(r.PathValue("projectId"), r.PathValue("repoId"), body.BindingID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, result)
+	})
 	mux.HandleFunc("POST /api/projects/{projectId}/repositories/{repoId}/intake/poll", func(w http.ResponseWriter, r *http.Request) {
 		result, err := e.pollRepositoryIntake(r.Context(), r.PathValue("projectId"), r.PathValue("repoId"))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, result)
+	})
+	mux.HandleFunc("POST /api/projects/{projectId}/repositories/{repoId}/intake/jobs/{jobId}/release", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			HeadSHA string `json:"headSHA"`
+			BaseSHA string `json:"baseSHA"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := e.releaseRetainedIssueJob(r.Context(), r.PathValue("projectId"), r.PathValue("repoId"), r.PathValue("jobId"), body.HeadSHA, body.BaseSHA)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, result)
+	})
+	mux.HandleFunc("POST /api/projects/{projectId}/repositories/{repoId}/intake/revisions/{jobId}/recover", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Action  string `json:"action"`
+			BaseSHA string `json:"baseSHA"`
+			HeadSHA string `json:"headSHA"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := e.recoverReviewJob(r.Context(), r.PathValue("projectId"), r.PathValue("repoId"), r.PathValue("jobId"), body.Action, body.BaseSHA, body.HeadSHA)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, result)
+	})
+	mux.HandleFunc("POST /api/projects/{projectId}/repositories/{repoId}/intake/synchronizations/{jobId}/recover", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Action             string `json:"action"`
+			PullRequestHeadSHA string `json:"pullRequestHeadSHA"`
+			BaseSHA            string `json:"baseSHA"`
+			HeadSHA            string `json:"headSHA"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := e.recoverSyncJob(r.Context(), r.PathValue("projectId"), r.PathValue("repoId"), r.PathValue("jobId"), body.Action, body.PullRequestHeadSHA, body.BaseSHA, body.HeadSHA)
 		if err != nil {
 			writeError(w, err)
 			return
