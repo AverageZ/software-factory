@@ -1,6 +1,8 @@
 # Software Factory repository
 
-This directory is the Factory application, not the parent `projects/` launcher. Factory is a local Go/SQLite daemon with a React/TypeScript dashboard; `poc.md` is the original specification, while `README.md` describes the implemented behavior and operational limits.
+Use ASD-STE100 Simplified Technical English (STE).
+
+Factory is a local Go/SQLite daemon with a React/TypeScript dashboard.
 
 ## Change and verification conventions
 
@@ -10,6 +12,6 @@ This directory is the Factory application, not the parent `projects/` launcher. 
 - Do not commit generated `web/dist`, dependencies, `.factory-data`, secrets, or local databases. The active daemon data is `~/.factory`, outside this checkout; `.factory-data/v2` is an obsolete local snapshot, not a reproducible repository fixture. Keep self-hosted managed worktrees outside this Git root.
 - When operating inside a Factory-managed issue or PR revision worktree, follow the managed prompt: leave commits, branches, pushes, labels, PRs, and worktree lifecycle to Factory. Do not restart the daemon during an active job.
 
-## Self-hosted dogfood loop
+## Managed changes to Factory
 
-The `Software Factory` project in the local daemon attaches this Git root. GitHub issue intake requires an open issue on `AverageZ/software-factory` with `agent:run`; the default repair workflow creates a **draft** PR, not a merge. On that Factory-owned PR, `agent:run` separately authorizes trusted review feedback revisions. Humans review and merge. No unlabelled issue, generic checkout-bound workflow, or automatic merge is part of the loop. See the dogfood section of `README.md` for setup and recovery.
+Select an issue workflow binding before enabling GitHub intake. `agent:run` on an open issue authorizes that binding. The managed publication step creates a draft PR. A separate PR revision binding and `agent:run` on the PR authorize review changes. Humans review and merge. See `README.md` for setup and recovery.

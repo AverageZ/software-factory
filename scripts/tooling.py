@@ -30,7 +30,7 @@ def main():
     env = environment()
     require("go", env)
     if command == "bootstrap":
-        for binary in ("node", "npm", "git", "omp"):
+        for binary in ("node", "npm", "git", "lsof"):
             require(binary, env)
         run(["go", "mod", "download"], env)
         run(["npm", "ci", "--no-audit", "--no-fund"], env, ROOT / "web")
@@ -40,6 +40,7 @@ def main():
         run(["npm", "run", "build"], env, ROOT / "web")
     elif command == "test":
         run(["go", "test", "-race", "./..."], env)
+        run([sys.executable, "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"], env)
         run(["npm", "run", "build"], env, ROOT / "web")
     elif command in ("fmt", "check-fmt"):
         formatting(env, command == "fmt")

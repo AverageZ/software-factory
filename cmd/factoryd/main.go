@@ -18,6 +18,8 @@ import (
 )
 
 func run(ctx context.Context, args []string) (err error) {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -46,8 +48,13 @@ func run(ctx context.Context, args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, engine.Close()) }()
-	server := &http.Server{Handler: engine.Handler(*web, *allowPublic), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	control, err := startRestartControl(listener.Addr().String(), *data, *web, args, engine.PrepareRestart, stop)
+	if err != nil {
+		return errors.Join(err, engine.Close())
+	}
+	// Keep control discovery alive until the engine has released durable state.
+	defer func() { err = errors.Join(err, engine.Close(), control.close()) }()
+	server := &http.Server{Handler: control.handler(engine.Handler(*web, *allowPublic)), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	serving := make(chan error, 1)
 	go func() { serving <- server.Serve(listener) }()
 	if *allowPublic {

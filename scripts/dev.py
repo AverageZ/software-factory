@@ -11,7 +11,6 @@ from common import ROOT, STATE, Processes, environment, require, require_port
 def main():
     env = environment()
     require("npm", env)
-    require("omp", env)
     for port in (8080, 5173):
         require_port(port)
     daemon = STATE / "bin" / "factoryd"
@@ -26,7 +25,7 @@ def main():
         stack.start("Factory UI", ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173", "--strictPort"], ROOT / "web")
         stack.wait_port(5173)
         print("Factory http://127.0.0.1:5173 | API http://127.0.0.1:8080", flush=True)
-        print("Real execution only. Repository commands and agents run with your local permissions.", flush=True)
+        print("Only configured workflows execute, with your local permissions.", flush=True)
         stack.serve()
 
 
