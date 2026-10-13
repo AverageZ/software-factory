@@ -2,6 +2,7 @@ package factory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -324,9 +325,9 @@ func (e *Engine) releaseRetainedIssueJob(ctx context.Context, projectID, reposit
 		e.mu.Unlock()
 		return IntakeReport{}, conflict("issue job is active")
 	}
-	if job.Status != "failed" && job.Status != "interrupted" && job.Status != "paused" {
+	if job.Status != "failed" && job.Status != "timed_out" && job.Status != "interrupted" && job.Status != "paused" {
 		e.mu.Unlock()
-		return IntakeReport{}, conflict("only a failed, interrupted, or paused issue candidate can be released")
+		return IntakeReport{}, conflict("only a failed, timed-out, interrupted, or paused issue candidate can be released")
 	}
 	if job.Worktree == "" {
 		e.mu.Unlock()
@@ -508,7 +509,7 @@ func (e *Engine) pollRepositoryIntake(ctx context.Context, projectID, repository
 		}
 		if j.Branch != "" && (j.HeadSHA != "" || j.PullRequestNumber > 0) {
 			if err := e.reconcileIssuePR(operation, j); err != nil && pollErr == nil {
-				pollErr = err
+				pollErr = fmt.Errorf("reconcile %s: %w", managedWorkTitle("Issue", j.Number, j.Title), err)
 			}
 		}
 	}
@@ -681,9 +682,18 @@ func (e *Engine) workIssue(ctx context.Context, j savedIssueJob) {
 		return
 	}
 	defer release()
+	prepared := j.Worktree != "" && j.BaseSHA != ""
 	fail := func(status string, err error) {
+		if prepared {
+			if retainErr := retainStoppedIssueWorkspace(j.Repository.Path, j.workspace()); retainErr != nil {
+				err = errors.Join(err, fmt.Errorf("record retained issue workspace: %w", retainErr))
+			}
+		}
 		j.Status = status
 		j.Error = err.Error()
+		if executionStatus(err) == "timed_out" {
+			j.Status = "timed_out"
+		}
 		if ctx.Err() != nil {
 			j.Status = "interrupted"
 		}
@@ -693,6 +703,9 @@ func (e *Engine) workIssue(ctx context.Context, j savedIssueJob) {
 		runStatus := "failed"
 		if status == "paused" {
 			runStatus = "waiting"
+		}
+		if j.Status == "timed_out" {
+			runStatus = "timed_out"
 		}
 		if ctx.Err() != nil {
 			runStatus = "interrupted"
@@ -720,6 +733,7 @@ func (e *Engine) workIssue(ctx context.Context, j savedIssueJob) {
 				return
 			}
 			j.setWorkspace(workspace)
+			prepared = true
 			if err = e.saveIssueJob(j); err != nil {
 				return
 			}

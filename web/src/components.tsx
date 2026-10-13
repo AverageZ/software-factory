@@ -31,7 +31,11 @@ export function PageHeader({
 }
 
 export function Status({ status }: { status: string }) {
-  return <span className={`status status-${status}`}>{status}</span>;
+  return (
+    <span className={`status status-${status}`} title={status}>
+      {status.replaceAll("_", " ")}
+    </span>
+  );
 }
 
 export function JsonField({
@@ -69,7 +73,7 @@ export function RunTable({ runs, projects }: { runs: Run[]; projects: Project[] 
       <table>
         <thead>
           <tr>
-            <th>Run</th>
+            <th>Work</th>
             <th>Project</th>
             <th>Status</th>
             <th>Started</th>
@@ -81,13 +85,14 @@ export function RunTable({ runs, projects }: { runs: Run[]; projects: Project[] 
             .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
             .map((run) => (
               <tr key={run.id}>
-                <td>
+                <td className="run-name">
                   <a href={`#/runs/${encodeURIComponent(run.id)}`}>
-                    <code>{run.id.slice(0, 12)}</code>
+                    <strong>{run.title}</strong>
                   </a>
-                  {run.parentRunId && (
-                    <span className="muted"> · child run</span>
-                  )}
+                  <span className="muted">
+                    <code>{run.id.slice(0, 12)}</code>
+                    {run.parentRunId ? " · child run" : ""}
+                  </span>
                 </td>
                 <td>
                   {projects.find((project) => project.id === run.projectId)

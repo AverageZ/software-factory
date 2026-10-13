@@ -237,6 +237,53 @@ func TestRetainedWorkspaceAllowsAnotherManagedJob(t *testing.T) {
 	}
 }
 
+func TestOpenRetainsFailedWorkspaceAndAllowsNextJob(t *testing.T) {
+	f := newWorkspaceFixture(t)
+	release, err := acquireIssueLease(f.repository, "failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := prepareIssueWorkspace(context.Background(), f.data, f.repository, "failed", f.remote, "main")
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	workspaceTestWrite(t, filepath.Join(workspace.Path, "unfinished.txt"), []byte("preserve this work\n"))
+	release()
+
+	store, err := openStore(f.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := Project{ID: "project", Repositories: []Repository{{ID: "repository", Path: f.repository}}, Policy: Policy{MaxParallel: 1}}
+	job := savedIssueJob{
+		IssueJob:   IssueJob{ID: "failed", ProjectID: project.ID, RepositoryID: "repository", Status: "failed"},
+		Project:    project,
+		Repository: project.Repositories[0],
+	}
+	job.setWorkspace(workspace)
+	if err := store.save(record{"issue-job", job.ID, job}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := Open(f.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	other, err := acquireIssueLease(f.repository, "next")
+	if err != nil {
+		t.Fatalf("failed retained work blocked the next job after restart: %v", err)
+	}
+	other()
+	if contents, err := os.ReadFile(filepath.Join(workspace.Path, "unfinished.txt")); err != nil || string(contents) != "preserve this work\n" {
+		t.Fatalf("startup changed retained work: %q, %v", contents, err)
+	}
+}
+
 func TestIssueWorkspaceCheckpointIncludesBinaryUntrackedAndDeletion(t *testing.T) {
 	f := newWorkspaceFixture(t)
 	w := workspaceTestPrepare(t, f, "binary")

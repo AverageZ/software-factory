@@ -833,6 +833,32 @@ func retainIssueWorkspace(ctx context.Context, repositoryPath string, w issueWor
 	return issueWriteOwner(owner.CommonDir, jobID, owner, false)
 }
 
+// The caller holds the repository lease. Retention must still finish when the
+// execution context was cancelled or reached its deadline.
+func retainStoppedIssueWorkspace(repositoryPath string, w issueWorkspace) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return retainIssueWorkspace(ctx, repositoryPath, w)
+}
+
+// Startup has no worker lease. Validate the complete saved identity while
+// holding the repository-wide lease before converting an interrupted owner
+// record into an explicitly retained workspace.
+func recoverIssueWorkspaceRetention(repositoryPath string, w issueWorkspace) error {
+	if w.Path == "" {
+		return nil
+	}
+	if w.Branch == "" || w.BaseSHA == "" {
+		return errors.New("saved workspace identity is incomplete")
+	}
+	release, _, err := acquireRepositoryLease(repositoryPath)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return retainStoppedIssueWorkspace(repositoryPath, w)
+}
+
 func discardIssueWorkspace(ctx context.Context, data, repositoryPath, jobID string, w issueWorkspace) error {
 	if err := issueValidateCleanupTarget(data, jobID, w); err != nil {
 		return err

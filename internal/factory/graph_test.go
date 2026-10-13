@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBranchMergeWaitsForAllPredecessorsButIgnoresSkippedPath(t *testing.T) {
@@ -564,5 +565,87 @@ func TestTaskOutputJSONIsOptIn(t *testing.T) {
 		if _, exists := envelope["data"]; exists {
 			t.Fatal("plain process output acquired structured data")
 		}
+	}
+}
+
+func TestTimedOutExecutionIsNamedAndReleasesCapacity(t *testing.T) {
+	e, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	repository := t.TempDir()
+	workspaceTestGit(t, repository, "init", "--initial-branch=main")
+	project, err := e.SaveProject(Project{
+		ID:           "project",
+		Name:         "Project",
+		Repositories: []Repository{{ID: "repository", Name: "Repository", Path: repository}},
+		Policy:       Policy{MaxParallel: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slow, err := e.SaveWorkflow(Workflow{
+		ID:   "slow",
+		Name: "Slow workflow",
+		Nodes: []WorkflowNode{{
+			ID: "wait", Name: "Wait forever", Kind: "command", Repository: "source",
+			Config: map[string]any{"command": []any{"sh", "-c", "sleep 10"}, "timeoutSeconds": 0.05},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fast, err := e.SaveWorkflow(Workflow{
+		ID:   "fast",
+		Name: "Fast workflow",
+		Nodes: []WorkflowNode{{
+			ID: "finish", Name: "Finish next work", Kind: "command", Repository: "source",
+			Config: map[string]any{"command": []any{"sh", "-c", "printf done"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowBinding, err := e.SaveBinding(Binding{ID: "slow-binding", Name: "Issue #42: Hung automation", ProjectID: project.ID, WorkflowID: slow.ID, Repositories: map[string]string{"source": "repository"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastBinding, err := e.SaveBinding(Binding{ID: "fast-binding", Name: "Issue #43: Next work", ProjectID: project.ID, WorkflowID: fast.ID, Repositories: map[string]string{"source": "repository"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timedOut, err := e.Start(slowBinding.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := e.Start(fastBinding.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		timedOut, err = e.Run(timedOut.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, err = e.Run(next.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if terminal(timedOut.Status) && terminal(next.Status) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	execution := timedOut.Nodes["wait"]
+	if timedOut.Status != "failed" || execution.Status != "timed_out" || execution.DeadlineAt == "" || !strings.Contains(execution.Error, "released its execution capacity") {
+		t.Fatalf("timeout was not explicit: run=%+v node=%+v", timedOut, execution)
+	}
+	if timedOut.Title != "Issue #42: Hung automation: Slow workflow" || execution.Name != "Wait forever" {
+		t.Fatalf("work names were not exposed: run=%q node=%q", timedOut.Title, execution.Name)
+	}
+	if next.Status != "succeeded" || next.Nodes["finish"].Status != "succeeded" {
+		t.Fatalf("timed-out execution blocked later work: %+v", next)
 	}
 }

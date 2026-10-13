@@ -18,6 +18,8 @@ type ReviewJob struct {
 	RepositoryID      string   `json:"repositoryId"`
 	IssueJobID        string   `json:"issueJobId"`
 	PullRequestNumber int      `json:"pullRequestNumber"`
+	Title             string   `json:"title"`
+	URL               string   `json:"url"`
 	Status            string   `json:"status"`
 	Error             string   `json:"error,omitempty"`
 	RunID             string   `json:"runId,omitempty"`
@@ -222,7 +224,7 @@ func (e *Engine) pollReviewJobs(ctx context.Context, config intakeConfig) error 
 			e.mu.Unlock()
 			continue
 		}
-		j := savedReviewJob{ReviewJob: ReviewJob{ID: uuid.NewString(), ProjectID: issue.ProjectID, RepositoryID: issue.RepositoryID, IssueJobID: issue.ID, PullRequestNumber: pr.Number, Status: "queued", BaseSHA: pr.Head.SHA, FeedbackKeys: []string{}}, Binding: b, Workflow: w, Project: p, Issue: issue, Feedback: fresh}
+		j := savedReviewJob{ReviewJob: ReviewJob{ID: uuid.NewString(), ProjectID: issue.ProjectID, RepositoryID: issue.RepositoryID, IssueJobID: issue.ID, PullRequestNumber: pr.Number, Title: issue.Title, URL: issue.PullRequestURL, Status: "queued", BaseSHA: pr.Head.SHA, FeedbackKeys: []string{}}, Binding: b, Workflow: w, Project: p, Issue: issue, Feedback: fresh}
 		for _, item := range fresh {
 			j.FeedbackKeys = append(j.FeedbackKeys, item.Key)
 		}
@@ -308,11 +310,14 @@ func (e *Engine) workReview(ctx context.Context, j savedReviewJob) {
 	prepared := false
 	fail := func(err error) {
 		if prepared {
-			if retainErr := retainIssueWorkspace(ctx, j.Issue.Repository.Path, j.workspace()); retainErr != nil {
+			if retainErr := retainStoppedIssueWorkspace(j.Issue.Repository.Path, j.workspace()); retainErr != nil {
 				err = errors.Join(err, fmt.Errorf("record retained revision workspace: %w", retainErr))
 			}
 		}
 		j.Status = "failed"
+		if executionStatus(err) == "timed_out" {
+			j.Status = "timed_out"
+		}
 		if ctx.Err() != nil {
 			j.Status = "interrupted"
 		}
@@ -445,13 +450,15 @@ func (e *Engine) executeReviewAgent(ctx context.Context, j *savedReviewJob) erro
 	b.Inputs = inputs
 	r := newRun(p, b, w, map[string]Workflow{w.ID: w}, inputs, "")
 	r.IssueJobID = j.IssueJobID // managed runs cannot be retried outside the safety envelope.
+	r.Run.Title = managedPRTitle(j.PullRequestNumber, "revision", j.Title)
+	r.Run.SubjectURL = j.URL
 	x := r.Run.Nodes[n.ID]
 	x.Status = "running"
 	x.Attempt = 1
 	x.StartedAt = now()
+	x.DeadlineAt = executionDeadline(x.StartedAt, n)
 	x.LogPath = logRelative(r.Run.ID, n.ID, 1)
 	r.Run.Nodes[n.ID] = x
-	r.Run.Status = "running"
 	addEvent(&r.Run, n.ID, "running", "Executing review workflow in isolated PR-head worktree")
 	j.RunID = r.Run.ID
 	e.mu.Lock()
@@ -485,7 +492,7 @@ func (e *Engine) executeReviewAgent(ctx context.Context, j *savedReviewJob) erro
 	x.Status = "succeeded"
 	x.Error = ""
 	if result.err != nil {
-		x.Status = "failed"
+		x.Status = executionStatus(result.err)
 		x.Error = result.err.Error()
 	}
 	if ctx.Err() != nil {

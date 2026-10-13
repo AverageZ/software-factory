@@ -57,6 +57,8 @@ A workflow is a reusable sequence of steps. For example: inspect an issue, chang
 4. Create a **binding** for the project. A binding selects the workflow's repositories and supplies its settings.
 5. Start the binding. Open the run to see results, logs, files, and approval requests.
 
+The Runs page shows a binding and workflow name for manual work. Managed runs show the issue or PR number and title. The run UUID and node ID remain available as secondary identifiers.
+
 Steps can run an agent, execute a command, call HTTP, request approval, choose a branch, run parallel work, or call another workflow. Decision-provider steps are not available.
 
 Agent steps use the selected repository's OMP rules and environment. Command steps use its scripts. No Factory configuration file is required in the repository.
@@ -64,6 +66,8 @@ Agent steps use the selected repository's OMP rules and environment. Command ste
 New workflows use the declarative Given / If / Then editor. The declaration is the source of truth and Factory compiles it to the durable execution graph. Existing simple workflows retain the step editor. Custom graphs retain **Advanced: edit connections** so the UI does not make a lossy conversion.
 
 Given guards the whole workflow. Each matching If runs its Then action in order; a false If skips that step and continues. Named results can supply later conditions and inputs. The editor's GitHub examples only create conditions and input shapes. They do not subscribe to GitHub events, grant authorization, approve, or merge.
+
+Every agent, command, and HTTP integration step has an execution deadline. The default is one hour. Set `timeoutSeconds` on a custom graph node when a step needs a different limit. The run detail shows the deadline. If the deadline expires, Factory stops the process group, records the node as **timed out**, and releases its execution slot.
 
 ## GitHub triggers
 

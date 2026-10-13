@@ -410,7 +410,10 @@ export function IssueIntake({
             {report.revisions.map((revision) => (
               <li className="stack github-intake-job" key={revision.id}>
                 <div className="github-report-heading">
-                  PR #{revision.pullRequestNumber} <Status status={revision.status} />
+                  <a href={revision.url} target="_blank" rel="noreferrer">
+                    PR #{revision.pullRequestNumber} {revision.title}
+                  </a>
+                  <Status status={revision.status} />
                 </div>
                 <ErrorNotice message={revision.error ?? ""} />
                 {revision.runId && (
@@ -443,7 +446,9 @@ export function IssueIntake({
             {report.synchronizations.map((synchronization) => (
               <li className="stack github-intake-job" key={synchronization.id}>
                 <div className="github-report-heading">
-                  PR #{synchronization.pullRequestNumber}{" "}
+                  <a href={synchronization.url} target="_blank" rel="noreferrer">
+                    PR #{synchronization.pullRequestNumber} {synchronization.title}
+                  </a>
                   <Status status={synchronization.status} />
                 </div>
                 <ErrorNotice message={synchronization.error ?? ""} />
@@ -492,7 +497,7 @@ function ManagedRecoveryActions({
   recovering: boolean;
   onRecover: (action: RecoveryAction) => void;
 }) {
-  if (!["failed", "interrupted"].includes(job.status)) return null;
+  if (!["failed", "timed_out", "interrupted"].includes(job.status)) return null;
   return (
     <div className="stack">
       <div className="actions">
@@ -535,7 +540,7 @@ function IntakeJob({
   releasing: boolean;
   onRelease: (job: IssueJob) => void;
 }) {
-  const retained = ["failed", "interrupted", "paused"].includes(job.status);
+  const retained = ["failed", "timed_out", "interrupted", "paused"].includes(job.status);
   const cleanupPending = ["published", "closed"].includes(job.status);
   return (
     <li className="stack github-intake-job">

@@ -67,6 +67,7 @@ export interface IssueJob {
     | "published"
     | "closed"
     | "failed"
+    | "timed_out"
     | "interrupted"
     | "released";
   error?: string;
@@ -83,6 +84,8 @@ export interface ReviewJob {
   id: string;
   issueJobId: string;
   pullRequestNumber: number;
+  title: string;
+  url: string;
   status: string;
   error?: string;
   runId?: string;
@@ -96,6 +99,8 @@ export interface SyncJob {
   id: string;
   issueJobId: string;
   pullRequestNumber: number;
+  title: string;
+  url: string;
   status: string;
   error?: string;
   runId?: string;
@@ -222,15 +227,18 @@ export type NodeStatus =
   | "waiting"
   | "succeeded"
   | "failed"
+  | "timed_out"
   | "skipped"
   | "interrupted"
   | "cancelled"
   | "unavailable";
 export interface NodeExecution {
   nodeId: string;
+  name: string;
   status: NodeStatus;
   attempt: number;
   startedAt?: string;
+  deadlineAt?: string;
   finishedAt?: string;
   outputs: Record<string, Value>;
   error?: string;
@@ -246,6 +254,8 @@ export interface RunEvent {
 }
 export interface Run {
   id: string;
+  title: string;
+  subjectUrl?: string;
   projectId: string;
   bindingId: string;
   workflowId: string;

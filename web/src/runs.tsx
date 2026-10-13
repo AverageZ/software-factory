@@ -86,6 +86,7 @@ export function RunPage({
               (node) =>
                 node.status === "waiting" ||
                 node.status === "failed" ||
+                node.status === "timed_out" ||
                 node.status === "running",
             )?.nodeId ||
             Object.keys(recorded.nodes)[0] ||
@@ -185,9 +186,14 @@ export function RunPage({
   return (
     <>
       <PageHeader
-        title={`Run ${run.id.slice(0, 12)}`}
-        description={`${project?.name || run.projectId} · ${binding?.name || run.bindingId}`}
+        title={run.title}
+        description={`${project?.name || run.projectId} · ${binding?.name || run.bindingId} · Run ${run.id.slice(0, 12)}`}
       >
+        {run.subjectUrl && (
+          <a className="button" href={run.subjectUrl} target="_blank" rel="noreferrer">
+            Open issue or PR
+          </a>
+        )}
         <a className="button" href={href("projects", run.projectId)}>
           Project
         </a>
@@ -244,10 +250,10 @@ export function RunPage({
               key={entry.nodeId}
               onClick={() => setSelectedNodeId(entry.nodeId)}
             >
-              <code>{entry.nodeId}</code>
+              <strong>{entry.name}</strong>
               <Status status={entry.status} />
               <small>
-                Attempt {entry.attempt}
+                <code>{entry.nodeId}</code> · Attempt {entry.attempt}
                 {entry.childRunId ? " · child workflow" : ""}
               </small>
             </button>
@@ -257,14 +263,16 @@ export function RunPage({
           {node ? (
             <>
               <div className="section-heading">
-                <h2>
+                <div>
+                  <h2>{node.name}</h2>
                   <code>{node.nodeId}</code>
-                </h2>
+                </div>
                 <Status status={node.status} />
               </div>
               <p className="muted">
                 Attempt {node.attempt} · started {timestamp(node.startedAt)} ·
-                finished {timestamp(node.finishedAt)}
+                {node.deadlineAt ? ` deadline ${timestamp(node.deadlineAt)} ·` : ""}
+                {" "}finished {timestamp(node.finishedAt)}
               </p>
               {node.error && <div className="notice error">{node.error}</div>}
               {node.status === "unavailable" && (
@@ -316,7 +324,7 @@ export function RunPage({
                   </div>
                 </div>
               )}
-              {["failed", "interrupted", "unavailable", "cancelled"].includes(
+              {["failed", "timed_out", "interrupted", "unavailable", "cancelled"].includes(
                 node.status,
               ) && (
                 <div className="notice warning">

@@ -95,10 +95,13 @@ func (e *Engine) executeIssueAgent(ctx context.Context, j *savedIssueJob) error 
 	b.Inputs = inputs
 	r := newRun(p, b, w, map[string]Workflow{w.ID: w}, inputs, "")
 	r.IssueJobID = j.ID
+	r.Run.Title = managedWorkTitle("Issue", j.Number, j.Title)
+	r.Run.SubjectURL = j.URL
 	x := r.Run.Nodes[n.ID]
 	x.Status = "running"
 	x.Attempt = 1
 	x.StartedAt = now()
+	x.DeadlineAt = executionDeadline(x.StartedAt, n)
 	x.LogPath = logRelative(r.Run.ID, n.ID, 1)
 	r.Run.Nodes[n.ID] = x
 	r.Run.Status = "running"
@@ -141,7 +144,7 @@ func (e *Engine) executeIssueAgent(ctx context.Context, j *savedIssueJob) error 
 		x.Status = "succeeded"
 		x.Error = ""
 		if result.err != nil {
-			x.Status = "failed"
+			x.Status = executionStatus(result.err)
 			x.Error = result.err.Error()
 		}
 		if e.ctx.Err() != nil {
@@ -188,7 +191,7 @@ func (e *Engine) recordIssuePublication(j savedIssueJob, status, message string,
 	}
 	x.Status = status
 	x.Error = ""
-	if status == "failed" || status == "interrupted" || status == "waiting" {
+	if status == "failed" || status == "timed_out" || status == "interrupted" || status == "waiting" {
 		x.Error = message
 	}
 	if x.Attempt == 0 {

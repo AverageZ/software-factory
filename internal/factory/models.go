@@ -107,9 +107,11 @@ type Layout struct {
 }
 type NodeExecution struct {
 	NodeID     string           `json:"nodeId"`
+	Name       string           `json:"name"`
 	Status     string           `json:"status"`
 	Attempt    int              `json:"attempt"`
 	StartedAt  string           `json:"startedAt,omitempty"`
+	DeadlineAt string           `json:"deadlineAt,omitempty"`
 	FinishedAt string           `json:"finishedAt,omitempty"`
 	Outputs    map[string]Value `json:"outputs"`
 	Error      string           `json:"error,omitempty"`
@@ -125,6 +127,8 @@ type Event struct {
 }
 type Run struct {
 	ID          string                   `json:"id"`
+	Title       string                   `json:"title"`
+	SubjectURL  string                   `json:"subjectUrl,omitempty"`
 	ProjectID   string                   `json:"projectId"`
 	BindingID   string                   `json:"bindingId"`
 	WorkflowID  string                   `json:"workflowId"`
@@ -166,7 +170,7 @@ func copyJSON[T any](value T) T {
 }
 func terminal(status string) bool {
 	switch status {
-	case "succeeded", "failed", "skipped", "interrupted", "cancelled", "unavailable":
+	case "succeeded", "failed", "timed_out", "skipped", "interrupted", "cancelled", "unavailable":
 		return true
 	}
 	return false

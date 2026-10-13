@@ -17,6 +17,8 @@ type SyncJob struct {
 	RepositoryID       string `json:"repositoryId"`
 	IssueJobID         string `json:"issueJobId"`
 	PullRequestNumber  int    `json:"pullRequestNumber"`
+	Title              string `json:"title"`
+	URL                string `json:"url"`
 	Status             string `json:"status"`
 	Error              string `json:"error,omitempty"`
 	RunID              string `json:"runId,omitempty"`
@@ -219,6 +221,8 @@ func (e *Engine) pollSyncJobs(ctx context.Context, config intakeConfig) error {
 				RepositoryID:       issue.RepositoryID,
 				IssueJobID:         issue.ID,
 				PullRequestNumber:  pr.Number,
+				Title:              issue.Title,
+				URL:                issue.PullRequestURL,
 				Status:             "queued",
 				PullRequestHeadSHA: pr.Head.SHA,
 				BaseSHA:            baseSHA,
@@ -346,11 +350,14 @@ func (e *Engine) workSync(ctx context.Context, job savedSyncJob) {
 			return
 		}
 		if prepared {
-			if retainErr := retainIssueWorkspace(ctx, job.Issue.Repository.Path, job.workspace()); retainErr != nil {
+			if retainErr := retainStoppedIssueWorkspace(job.Issue.Repository.Path, job.workspace()); retainErr != nil {
 				err = errors.Join(err, fmt.Errorf("record retained synchronization workspace: %w", retainErr))
 			}
 		}
 		job.Status = "failed"
+		if executionStatus(err) == "timed_out" {
+			job.Status = "timed_out"
+		}
 		if ctx.Err() != nil {
 			job.Status = "interrupted"
 		}
@@ -462,10 +469,13 @@ func (e *Engine) executeSyncAgent(ctx context.Context, job *savedSyncJob) error 
 	binding.Inputs = inputs
 	run := newRun(project, binding, workflow, map[string]Workflow{workflow.ID: workflow}, inputs, "")
 	run.IssueJobID = job.IssueJobID
+	run.Run.Title = managedPRTitle(job.PullRequestNumber, "synchronization", job.Title)
+	run.Run.SubjectURL = job.URL
 	execution := run.Run.Nodes[node.ID]
 	execution.Status = "running"
 	execution.Attempt = 1
 	execution.StartedAt = now()
+	execution.DeadlineAt = executionDeadline(execution.StartedAt, node)
 	execution.LogPath = logRelative(run.Run.ID, node.ID, 1)
 	run.Run.Nodes[node.ID] = execution
 	run.Run.Status = "running"
@@ -503,7 +513,7 @@ func (e *Engine) executeSyncAgent(ctx context.Context, job *savedSyncJob) error 
 	execution.Status = "succeeded"
 	execution.Error = ""
 	if result.err != nil {
-		execution.Status = "failed"
+		execution.Status = executionStatus(result.err)
 		execution.Error = result.err.Error()
 	}
 	if ctx.Err() != nil {

@@ -18,7 +18,7 @@ func recoveryStatus(action string) (string, error) {
 }
 
 func recoverableManagedStatus(status string) bool {
-	return status == "failed" || status == "interrupted"
+	return status == "failed" || status == "timed_out" || status == "interrupted"
 }
 
 func (e *Engine) finishManagedRecovery(issueJobID string, wake bool) {
@@ -54,7 +54,7 @@ func (e *Engine) recoverReviewJob(ctx context.Context, projectID, repositoryID, 
 	}
 	if !recoverableManagedStatus(job.Status) {
 		e.mu.Unlock()
-		return IntakeReport{}, conflict("revision job is not failed or interrupted")
+		return IntakeReport{}, conflict("revision job is not failed, timed out, or interrupted")
 	}
 	if job.BaseSHA != expectedBaseSHA || job.HeadSHA != expectedHeadSHA {
 		e.mu.Unlock()
@@ -121,7 +121,7 @@ func (e *Engine) recoverSyncJob(ctx context.Context, projectID, repositoryID, jo
 	}
 	if !recoverableManagedStatus(job.Status) {
 		e.mu.Unlock()
-		return IntakeReport{}, conflict("synchronization job is not failed or interrupted")
+		return IntakeReport{}, conflict("synchronization job is not failed, timed out, or interrupted")
 	}
 	if job.PullRequestHeadSHA != expectedPullRequestHeadSHA || job.BaseSHA != expectedBaseSHA || job.HeadSHA != expectedHeadSHA {
 		e.mu.Unlock()

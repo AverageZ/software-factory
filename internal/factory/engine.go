@@ -61,6 +61,17 @@ type Engine struct {
 	closeErr    error
 }
 
+func workspaceRetentionError(message string, err error) string {
+	detail := "Workspace retention recovery failed: " + err.Error()
+	if strings.Contains(message, detail) {
+		return message
+	}
+	if message == "" {
+		return detail
+	}
+	return message + " " + detail
+}
+
 func Open(data string) (*Engine, error) {
 	if strings.HasPrefix(data, "~/") {
 		home, err := os.UserHomeDir()
@@ -157,13 +168,24 @@ func Open(data string) (*Engine, error) {
 		}
 	}
 	for id, job := range e.issueJobs {
+		changed := false
 		if job.Status == "working" {
 			job.Status = "interrupted"
 			job.Error = "Daemon stopped during local execution; workspace retained. Inspect local work and any surviving processes before recovery."
+			changed = true
 		} else if (job.Status == "queued" || job.Status == "paused" || job.Status == "publishing") && (job.Binding.ID == "" || len(job.Workflow.Nodes) != 1) {
 			job.Status = "paused"
 			job.Error = "Issue job has no configured workflow snapshot; automatic execution and publication are blocked. Inspect retained work before recovery."
-		} else {
+			changed = true
+		}
+		if job.Worktree != "" && (job.Status == "failed" || job.Status == "timed_out" || job.Status == "interrupted" || job.Status == "paused") {
+			if retentionErr := recoverIssueWorkspaceRetention(job.Repository.Path, job.workspace()); retentionErr != nil {
+				message := workspaceRetentionError(job.Error, retentionErr)
+				changed = changed || message != job.Error
+				job.Error = message
+			}
+		}
+		if !changed {
 			continue
 		}
 		job.UpdatedAt = now()
@@ -174,28 +196,52 @@ func Open(data string) (*Engine, error) {
 		e.issueJobs[id] = job
 	}
 	for id, job := range e.reviewJobs {
+		changed := false
 		if job.Status == "queued" || job.Status == "working" || job.Status == "publishing" {
 			job.Status = "interrupted"
 			job.Error = "Daemon stopped during revision admission, execution, or publication; inspect the PR head and retained worktree before recovery."
-			job.UpdatedAt = now()
-			if err := s.save(record{"review-job", id, job}); err != nil {
-				e.stop()
-				return fail(err)
-			}
-			e.reviewJobs[id] = job
+			changed = true
 		}
+		if job.Worktree != "" && recoverableManagedStatus(job.Status) {
+			if retentionErr := recoverIssueWorkspaceRetention(job.Issue.Repository.Path, job.workspace()); retentionErr != nil {
+				message := workspaceRetentionError(job.Error, retentionErr)
+				changed = changed || message != job.Error
+				job.Error = message
+			}
+		}
+		if !changed {
+			continue
+		}
+		job.UpdatedAt = now()
+		if err := s.save(record{"review-job", id, job}); err != nil {
+			e.stop()
+			return fail(err)
+		}
+		e.reviewJobs[id] = job
 	}
 	for id, job := range e.syncJobs {
+		changed := false
 		if job.Status == "queued" || job.Status == "working" || job.Status == "publishing" {
 			job.Status = "interrupted"
 			job.Error = "Daemon stopped during PR synchronization admission, execution, or publication; inspect the PR head and retained worktree before recovery."
-			job.UpdatedAt = now()
-			if err := s.save(record{"sync-job", id, job}); err != nil {
-				e.stop()
-				return fail(err)
-			}
-			e.syncJobs[id] = job
+			changed = true
 		}
+		if job.Worktree != "" && recoverableManagedStatus(job.Status) {
+			if retentionErr := recoverIssueWorkspaceRetention(job.Issue.Repository.Path, job.workspace()); retentionErr != nil {
+				message := workspaceRetentionError(job.Error, retentionErr)
+				changed = changed || message != job.Error
+				job.Error = message
+			}
+		}
+		if !changed {
+			continue
+		}
+		job.UpdatedAt = now()
+		if err := s.save(record{"sync-job", id, job}); err != nil {
+			e.stop()
+			return fail(err)
+		}
+		e.syncJobs[id] = job
 	}
 	e.wg.Add(1)
 	go e.intakeLoop()
@@ -427,11 +473,84 @@ func (e *Engine) SaveLayout(id string, layout Layout) (Layout, error) {
 	e.layouts[id] = layout
 	return copyJSON(layout), nil
 }
+func runTitle(binding Binding, workflow Workflow) string {
+	switch {
+	case binding.Name != "" && workflow.Name != "" && binding.Name != workflow.Name:
+		return binding.Name + ": " + workflow.Name
+	case binding.Name != "":
+		return binding.Name
+	case workflow.Name != "":
+		return workflow.Name
+	default:
+		return "Workflow run"
+	}
+}
+
+func managedWorkTitle(kind string, number int, title string) string {
+	name := fmt.Sprintf("%s #%d", kind, number)
+	if title != "" {
+		name += ": " + title
+	}
+	return name
+}
+func managedPRTitle(number int, activity, title string) string {
+	name := fmt.Sprintf("PR #%d %s", number, activity)
+	if title != "" {
+		name += ": " + title
+	}
+	return name
+}
+
+func (e *Engine) presentedRunLocked(saved savedRun) Run {
+	run := copyJSON(saved.Run)
+	if run.Title == "" {
+		run.Title = runTitle(saved.Binding, saved.Workflow)
+	}
+	if saved.IssueJobID != "" {
+		if issue, ok := e.issueJobs[saved.IssueJobID]; ok {
+			run.Title = managedWorkTitle("Issue", issue.Number, issue.Title)
+			run.SubjectURL = issue.URL
+			for _, revision := range e.reviewJobs {
+				if revision.RunID == run.ID {
+					run.Title = managedPRTitle(revision.PullRequestNumber, "revision", issue.Title)
+					run.SubjectURL = issue.PullRequestURL
+					break
+				}
+			}
+			for _, synchronization := range e.syncJobs {
+				if synchronization.RunID == run.ID {
+					run.Title = managedPRTitle(synchronization.PullRequestNumber, "synchronization", issue.Title)
+					run.SubjectURL = issue.PullRequestURL
+					break
+				}
+			}
+		}
+	}
+	for _, node := range saved.Workflow.Nodes {
+		execution := run.Nodes[node.ID]
+		if execution.Name == "" {
+			execution.Name = node.Name
+			if execution.Name == "" {
+				execution.Name = node.ID
+			}
+		}
+		if execution.DeadlineAt == "" && execution.StartedAt != "" && (declarationProcess(node.Kind) || node.Kind == "integration") {
+			execution.DeadlineAt = executionDeadline(execution.StartedAt, node)
+		}
+		run.Nodes[node.ID] = execution
+	}
+	return run
+}
+
 func newRun(p Project, b Binding, w Workflow, definitions map[string]Workflow, inputs map[string]Value, parent string) savedRun {
 	stamp := now()
-	r := Run{ID: uuid.NewString(), ProjectID: p.ID, BindingID: b.ID, WorkflowID: w.ID, Status: "queued", CreatedAt: stamp, UpdatedAt: stamp, Inputs: inputs, Nodes: map[string]NodeExecution{}, Events: []Event{}, ParentRunID: parent}
+	r := Run{ID: uuid.NewString(), Title: runTitle(b, w), ProjectID: p.ID, BindingID: b.ID, WorkflowID: w.ID, Status: "queued", CreatedAt: stamp, UpdatedAt: stamp, Inputs: inputs, Nodes: map[string]NodeExecution{}, Events: []Event{}, ParentRunID: parent}
 	for _, n := range w.Nodes {
-		r.Nodes[n.ID] = NodeExecution{NodeID: n.ID, Status: "pending", Outputs: map[string]Value{}, Artifacts: []string{}}
+		name := n.Name
+		if name == "" {
+			name = n.ID
+		}
+		r.Nodes[n.ID] = NodeExecution{NodeID: n.ID, Name: name, Status: "pending", Outputs: map[string]Value{}, Artifacts: []string{}}
 	}
 	addEvent(&r, "", "queued", "Run queued with immutable project, binding and workflow snapshots.")
 	return savedRun{Run: r, Project: p, Binding: b, Workflow: w, Definitions: definitions}
@@ -467,7 +586,7 @@ func (e *Engine) Start(bindingID string, inputs map[string]Value) (Run, error) {
 		return Run{}, err
 	}
 	e.notify()
-	return copyJSON(r.Run), nil
+	return e.presentedRunLocked(r), nil
 }
 func (e *Engine) Runs(projectID string) []Run {
 	e.mu.Lock()
@@ -475,7 +594,7 @@ func (e *Engine) Runs(projectID string) []Run {
 	runs := []Run{}
 	for _, r := range e.runs {
 		if projectID == "" || r.Run.ProjectID == projectID {
-			runs = append(runs, copyJSON(r.Run))
+			runs = append(runs, e.presentedRunLocked(r))
 		}
 	}
 	sort.Slice(runs, func(i, j int) bool { return runs[i].CreatedAt > runs[j].CreatedAt })
@@ -488,7 +607,7 @@ func (e *Engine) Run(id string) (Run, error) {
 	if !ok {
 		return Run{}, missing("run")
 	}
-	return copyJSON(r.Run), nil
+	return e.presentedRunLocked(r), nil
 }
 func workflowNode(w Workflow, id string) (WorkflowNode, bool) {
 	for _, n := range w.Nodes {
@@ -533,14 +652,15 @@ func (e *Engine) Approve(id, nodeID string, approved bool) (Run, error) {
 		return Run{}, err
 	}
 	e.notify()
-	return copyJSON(r.Run), nil
+	return e.presentedRunLocked(r), nil
 }
 func retryable(status string) bool {
-	return status == "failed" || status == "interrupted" || status == "cancelled" || status == "unavailable"
+	return status == "failed" || status == "timed_out" || status == "interrupted" || status == "cancelled" || status == "unavailable"
 }
 func resetExecution(x NodeExecution) NodeExecution {
 	x.Status = "pending"
 	x.StartedAt = ""
+	x.DeadlineAt = ""
 	x.FinishedAt = ""
 	x.Outputs = map[string]Value{}
 	x.Error = ""
@@ -587,7 +707,7 @@ func (e *Engine) Retry(id, nodeID string) (Run, error) {
 		return Run{}, missing("node")
 	}
 	if !retryable(x.Status) {
-		return Run{}, conflict("only failed, interrupted, unavailable or cancelled nodes can be retried")
+		return Run{}, conflict("only failed, timed-out, interrupted, unavailable or cancelled nodes can be retried")
 	}
 	if _, active := e.active[id+"/"+nodeID]; active {
 		return Run{}, conflict("previous execution is still stopping")
@@ -653,7 +773,7 @@ func (e *Engine) Retry(id, nodeID string) (Run, error) {
 		return Run{}, err
 	}
 	e.notify()
-	return copyJSON(e.runs[id].Run), nil
+	return e.presentedRunLocked(e.runs[id]), nil
 }
 func (e *Engine) Cancel(id string) (Run, error) {
 	e.mu.Lock()
@@ -712,5 +832,5 @@ func (e *Engine) Cancel(id string) (Run, error) {
 		}
 	}
 	e.notify()
-	return copyJSON(e.runs[id].Run), nil
+	return e.presentedRunLocked(e.runs[id]), nil
 }

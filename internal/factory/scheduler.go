@@ -113,9 +113,13 @@ func (e *Engine) pumpLocked() (bool, error) {
 			}
 			x.Attempt++
 			x.StartedAt = now()
+			x.DeadlineAt = ""
 			x.FinishedAt = ""
 			x.Error = ""
 			x.Status = "running"
+			if external {
+				x.DeadlineAt = executionDeadline(x.StartedAt, n)
+			}
 			if external {
 				x.LogPath = logRelative(r.Run.ID, n.ID, x.Attempt)
 				r.Run.Nodes[n.ID] = x
@@ -287,7 +291,7 @@ func deriveRunStatus(r *savedRun) {
 			if interrupted == "" {
 				interrupted = "Node " + n.ID + ": " + x.Error
 			}
-		case "failed", "unavailable", "cancelled":
+		case "failed", "timed_out", "unavailable", "cancelled":
 			if failure == "" {
 				failure = "Node " + n.ID + ": " + x.Error
 			}
@@ -341,7 +345,7 @@ func (e *Engine) execute(ctx context.Context, r savedRun, n WorkflowNode, inputs
 	x.Outputs = result.outputs
 	x.Artifacts = append(x.Artifacts, result.artifacts...)
 	if result.err != nil {
-		x.Status = "failed"
+		x.Status = executionStatus(result.err)
 		x.Error = result.err.Error()
 	}
 	if e.ctx.Err() != nil {

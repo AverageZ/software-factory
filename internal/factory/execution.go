@@ -19,6 +19,38 @@ import (
 )
 
 const outputLimit = 64 << 10
+const defaultExecutionTimeout = time.Hour
+
+type executionTimeoutError struct {
+	limit time.Duration
+}
+
+func (e *executionTimeoutError) Error() string {
+	return fmt.Sprintf("execution exceeded the %s timeout; Factory stopped the process and released its execution capacity", e.limit)
+}
+
+func executionTimeout(n WorkflowNode) time.Duration {
+	if seconds, ok := n.Config["timeoutSeconds"].(float64); ok {
+		return time.Duration(seconds * float64(time.Second))
+	}
+	return defaultExecutionTimeout
+}
+
+func executionDeadline(startedAt string, n WorkflowNode) string {
+	started, err := time.Parse(time.RFC3339Nano, startedAt)
+	if err != nil {
+		return ""
+	}
+	return started.Add(executionTimeout(n)).UTC().Format(time.RFC3339Nano)
+}
+
+func executionStatus(err error) string {
+	var timeout *executionTimeoutError
+	if errors.As(err, &timeout) {
+		return "timed_out"
+	}
+	return "failed"
+}
 
 type executionResult struct {
 	outputs   map[string]Value
@@ -90,11 +122,16 @@ func (e *Engine) perform(ctx context.Context, r savedRun, n WorkflowNode, inputs
 	}
 	log := &transcript{file: file}
 	defer func() { result.err = errors.Join(result.err, log.err, file.Sync(), file.Close()) }()
-	if seconds, ok := n.Config["timeoutSeconds"].(float64); ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(seconds*float64(time.Second)))
-		defer cancel()
-	}
+	timeoutLimit := executionTimeout(n)
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeoutCause(ctx, timeoutLimit, &executionTimeoutError{limit: timeoutLimit})
+	defer cancel()
+	defer func() {
+		var timeout *executionTimeoutError
+		if errors.As(context.Cause(ctx), &timeout) {
+			result.err = timeout
+		}
+	}()
 	defer func() {
 		if result.err != nil {
 			return
@@ -129,7 +166,7 @@ func (e *Engine) perform(ctx context.Context, r savedRun, n WorkflowNode, inputs
 	}
 	for iteration := 1; iteration <= limit; iteration++ {
 		if err := ctx.Err(); err != nil {
-			result.err = err
+			result.err = context.Cause(ctx)
 			return
 		}
 		if looping {
@@ -272,7 +309,7 @@ func (e *Engine) performPass(ctx context.Context, r savedRun, n WorkflowNode, in
 			exitCode = exit.ExitCode()
 		}
 		if ctx.Err() != nil {
-			err = fmt.Errorf("execution stopped: %w", ctx.Err())
+			err = fmt.Errorf("execution stopped: %w", context.Cause(ctx))
 		}
 		result.err = err
 	}

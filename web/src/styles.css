@@ -661,6 +661,17 @@ th:first-child,
 td:first-child {
   padding-left: 0;
 }
+.run-name {
+  min-width: 320px;
+  white-space: normal;
+}
+.run-name > a,
+.run-name > span {
+  display: block;
+}
+.run-name > span {
+  margin-top: 4px;
+}
 .status {
   display: inline-flex;
   align-items: center;
@@ -692,7 +703,8 @@ td:first-child {
   border-color: #ead7a5;
   color: #8b621b;
 }
-.status-failed {
+.status-failed,
+.status-timed_out {
   background: #fff0f1;
   border-color: #efc6cc;
   color: #a02e3d;
