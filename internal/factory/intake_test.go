@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -205,5 +206,48 @@ func TestIssuePRRequiresOwnedHeadAndMarker(t *testing.T) {
 	pr.Number++
 	if err := validateIssuePR(pr, j); err == nil {
 		t.Fatal("recorded publication adopted a different PR number")
+	}
+}
+
+func TestRetainedFailureDoesNotBlockAnotherNamedIssue(t *testing.T) {
+	project := Project{ID: "project", Policy: Policy{MaxParallel: 2}}
+	retained := savedIssueJob{IssueJob: IssueJob{
+		ID: "retained", ProjectID: project.ID, RepositoryID: "repository",
+		GitHubRepositoryID: 123, Number: 41, Title: "Retained candidate",
+		Status: "failed", Worktree: "/retained",
+	}, Project: project}
+	queued := savedIssueJob{IssueJob: IssueJob{
+		ID: "queued", ProjectID: project.ID, RepositoryID: "repository",
+		GitHubRepositoryID: 123, Number: 42, Title: "Next ticket", Status: "queued",
+	}, Project: project}
+	e := &Engine{
+		intakes:     map[string]intakeConfig{},
+		issueJobs:   map[string]savedIssueJob{retained.ID: retained, queued.ID: queued},
+		reviewJobs:  map[string]savedReviewJob{},
+		syncJobs:    map[string]savedSyncJob{},
+		issueActive: map[string]bool{},
+		active:      map[string]activeExecution{},
+	}
+	if reason := e.issueWaitReasonLocked(queued); reason != "" {
+		t.Fatalf("retained failed work blocked another issue: %s", reason)
+	}
+
+	retained.Status = "published"
+	retained.PullRequestNumber = 84
+	e.issueJobs[retained.ID] = retained
+	revision := savedReviewJob{ReviewJob: ReviewJob{ID: "revision", IssueJobID: retained.ID, PullRequestNumber: 84}}
+	e.reviewJobs[revision.ID] = revision
+	e.issueActive[retained.ID] = true
+	e.active["review/"+revision.ID] = activeExecution{projectID: project.ID}
+	report := e.intakeReportLocked(project.ID, "repository")
+	var observed IssueJob
+	for _, job := range report.Jobs {
+		if job.ID == queued.ID {
+			observed = job
+			break
+		}
+	}
+	if !strings.Contains(observed.WaitingFor, "PR #84 revision: Retained candidate") {
+		t.Fatalf("active blocker was not named in the intake report: %+v", observed)
 	}
 }

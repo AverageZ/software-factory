@@ -556,6 +556,7 @@ function IntakeJob({
           </time>
         </span>
       </div>
+      {job.waitingFor && <div className="notice warning">{job.waitingFor}</div>}
       <ErrorNotice message={job.error ?? ""} />
       {(job.runId || job.pullRequestUrl) && (
         <div className="actions">

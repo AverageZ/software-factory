@@ -93,11 +93,15 @@ func TestEnabledIntakeDoesNotCreateWorkflowsOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(engine.workflows) != 0 || len(engine.bindings) != 0 {
+	if len(engine.Workflows()) != 0 || len(engine.Bindings()) != 0 {
 		t.Fatal("startup created workflows or bindings")
 	}
-	if c := engine.intakes[githubKey(project.ID, "repo")]; c.IssueBindingID != "" || c.ReviewBindingID != "" || c.SyncBindingID != "" {
-		t.Fatalf("startup selected an implicit workflow: %+v", c)
+	report, err := engine.repositoryIntake(project.ID, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.IssueBindingID != "" || report.ReviewBindingID != "" || report.SyncBindingID != "" {
+		t.Fatalf("startup selected an implicit workflow: %+v", report)
 	}
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
@@ -106,7 +110,7 @@ func TestEnabledIntakeDoesNotCreateWorkflowsOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(engine.workflows) != 0 || len(engine.bindings) != 0 {
+	if len(engine.Workflows()) != 0 || len(engine.Bindings()) != 0 {
 		t.Fatal("restart created workflows or bindings")
 	}
 	if _, err := engine.setReviewBinding(project.ID, "repo", ""); err != nil {

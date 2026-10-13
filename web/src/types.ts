@@ -71,6 +71,7 @@ export interface IssueJob {
     | "interrupted"
     | "released";
   error?: string;
+  waitingFor?: string;
   runId?: string;
   branch?: string;
   worktree?: string;

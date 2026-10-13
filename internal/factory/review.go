@@ -132,7 +132,7 @@ func (e *Engine) pollReviewJobs(ctx context.Context, config intakeConfig) error 
 			continue
 		}
 		e.mu.Lock()
-		busy := e.issueActive[issue.ID]
+		busy := e.repositoryIssueActiveLocked(issue.ProjectID, issue.RepositoryID)
 		existing := []savedReviewJob{}
 		retainedSync := false
 		for _, job := range e.reviewJobs {
@@ -298,6 +298,10 @@ func (e *Engine) workReview(ctx context.Context, j savedReviewJob) {
 		delete(e.active, "review/"+j.ID)
 		delete(e.issueActive, j.IssueJobID)
 		e.mu.Unlock()
+		select {
+		case e.intakeWake <- struct{}{}:
+		default:
+		}
 	}()
 	release, err := acquireIssueLease(j.Issue.Repository.Path, j.ID)
 	if err != nil {

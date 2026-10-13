@@ -33,6 +33,7 @@ type IssueJob struct {
 	URL                string `json:"url"`
 	Status             string `json:"status"`
 	Error              string `json:"error,omitempty"`
+	WaitingFor         string `json:"waitingFor,omitempty"`
 	RunID              string `json:"runId,omitempty"`
 	Branch             string `json:"branch,omitempty"`
 	Worktree           string `json:"worktree,omitempty"`
@@ -79,17 +80,35 @@ func (e *Engine) intakeReportLocked(projectID, repositoryID string) IntakeReport
 	}
 	for _, j := range e.issueJobs {
 		if j.ProjectID == projectID && j.RepositoryID == repositoryID {
-			report.Jobs = append(report.Jobs, j.IssueJob)
+			job := j.IssueJob
+			if job.Status == "queued" {
+				job.WaitingFor = e.issueWaitReasonLocked(j)
+			}
+			report.Jobs = append(report.Jobs, job)
 		}
 	}
 	for _, j := range e.reviewJobs {
 		if j.ProjectID == projectID && j.RepositoryID == repositoryID {
-			report.Revisions = append(report.Revisions, j.ReviewJob)
+			job := j.ReviewJob
+			if job.Title == "" {
+				job.Title = j.Issue.Title
+			}
+			if job.URL == "" {
+				job.URL = j.Issue.PullRequestURL
+			}
+			report.Revisions = append(report.Revisions, job)
 		}
 	}
 	for _, j := range e.syncJobs {
 		if j.ProjectID == projectID && j.RepositoryID == repositoryID {
-			report.Synchronizations = append(report.Synchronizations, j.SyncJob)
+			job := j.SyncJob
+			if job.Title == "" {
+				job.Title = j.Issue.Title
+			}
+			if job.URL == "" {
+				job.URL = j.Issue.PullRequestURL
+			}
+			report.Synchronizations = append(report.Synchronizations, job)
 		}
 	}
 	sort.Slice(report.Synchronizations, func(i, j int) bool {
@@ -353,7 +372,7 @@ func (e *Engine) releaseRetainedIssueJob(ctx context.Context, projectID, reposit
 		delete(e.active, activeKey)
 		delete(e.issueActive, jobID)
 		if released {
-			e.dispatchIssueJobsLocked(key)
+			e.dispatchIssueJobsLocked(key, "")
 		}
 		e.mu.Unlock()
 		e.notify()
@@ -445,6 +464,7 @@ func (e *Engine) pollRepositoryIntake(ctx context.Context, projectID, repository
 	stop := context.AfterFunc(e.ctx, cancel)
 	defer stop()
 	var pollErr error
+	issueDispatchReady := false
 	if config.Enabled {
 		e.mu.Lock()
 		pollErr = e.checkIssueBindingLocked(projectID, repositoryID, config.IssueBindingID)
@@ -492,6 +512,7 @@ func (e *Engine) pollRepositoryIntake(ctx context.Context, projectID, repository
 			}
 		}
 	}
+	issueDispatchReady = config.Enabled && pollErr == nil
 	// PR observation and safe local cleanup remain enabled after intake is disabled
 	// or issue authorization is removed. Neither action writes to GitHub.
 	e.mu.Lock()
@@ -536,17 +557,57 @@ func (e *Engine) pollRepositoryIntake(ctx context.Context, projectID, repository
 		return IntakeReport{}, err
 	}
 	e.intakes[key] = latest
-	if pollErr == nil && latest.Enabled {
-		e.dispatchIssueJobsLocked(key)
+	if issueDispatchReady && latest.Enabled {
+		e.dispatchIssueJobsLocked(key, "")
 	}
 	report := e.intakeReportLocked(projectID, repositoryID)
 	e.mu.Unlock()
 	return report, nil
 }
-func (e *Engine) dispatchIssueJobsLocked(key string) {
+func (e *Engine) activeManagedWorkLocked(repositoryID int64, excludeIssueJobID string) (string, bool) {
+	for _, issue := range valuesSorted(e.issueJobs) {
+		if issue.ID == excludeIssueJobID || issue.GitHubRepositoryID != repositoryID || !e.issueActive[issue.ID] {
+			continue
+		}
+		for _, revision := range e.reviewJobs {
+			if revision.IssueJobID == issue.ID {
+				if _, active := e.active["review/"+revision.ID]; active {
+					return managedPRTitle(revision.PullRequestNumber, "revision", issue.Title), true
+				}
+			}
+		}
+		for _, synchronization := range e.syncJobs {
+			if synchronization.IssueJobID == issue.ID {
+				if _, active := e.active["sync/"+synchronization.ID]; active {
+					return managedPRTitle(synchronization.PullRequestNumber, "synchronization", issue.Title), true
+				}
+			}
+		}
+		return managedWorkTitle("Issue", issue.Number, issue.Title), true
+	}
+	return "", false
+}
+
+func (e *Engine) issueWaitReasonLocked(job savedIssueJob) string {
+	if active, found := e.activeManagedWorkLocked(job.GitHubRepositoryID, job.ID); found {
+		return "Waiting for " + active + " to release the repository writer."
+	}
+	count := 0
+	for _, execution := range e.active {
+		if execution.projectID == job.ProjectID {
+			count++
+		}
+	}
+	if count >= job.Project.Policy.MaxParallel {
+		return fmt.Sprintf("Waiting for project execution capacity (%d of %d slots are in use).", count, job.Project.Policy.MaxParallel)
+	}
+	return ""
+}
+
+func (e *Engine) dispatchIssueJobsLocked(key, skipJobID string) {
 	jobs := valuesSorted(e.issueJobs)
 	for _, j := range jobs {
-		if githubKey(j.ProjectID, j.RepositoryID) != key || e.issueActive[j.ID] {
+		if j.ID == skipJobID || githubKey(j.ProjectID, j.RepositoryID) != key || e.issueActive[j.ID] {
 			continue
 		}
 		if j.Status != "queued" && j.Status != "paused" && j.Status != "publishing" {
@@ -555,40 +616,7 @@ func (e *Engine) dispatchIssueJobsLocked(key string) {
 		if j.Binding.ID == "" || len(j.Workflow.Nodes) != 1 {
 			continue
 		}
-		blocked := false
-		for _, other := range jobs {
-			if other.ID == j.ID {
-				continue
-			}
-			// Uncheckpointed interrupted/failed work is retained for intervention, not
-			// silently displaced by a fresh writer after a daemon restart.
-			if other.GitHubRepositoryID == j.GitHubRepositoryID && (e.issueActive[other.ID] || (other.Worktree != "" && (other.Status == "failed" || other.Status == "interrupted"))) {
-				blocked = true
-				break
-			}
-		}
-		for _, revision := range e.reviewJobs {
-			if revision.Issue.GitHubRepositoryID == j.GitHubRepositoryID && (e.issueActive[revision.IssueJobID] || (revision.Worktree != "" && revision.Status != "published")) {
-				blocked = true
-				break
-			}
-		}
-		for _, synchronization := range e.syncJobs {
-			if synchronization.Issue.GitHubRepositoryID == j.GitHubRepositoryID && (e.issueActive[synchronization.IssueJobID] || (synchronization.Worktree != "" && !syncJobResolved(synchronization.Status))) {
-				blocked = true
-				break
-			}
-		}
-		if blocked {
-			continue
-		}
-		count := 0
-		for _, a := range e.active {
-			if a.projectID == j.ProjectID {
-				count++
-			}
-		}
-		if count >= j.Project.Policy.MaxParallel {
+		if e.issueWaitReasonLocked(j) != "" {
 			continue
 		}
 		ctx, cancel := context.WithCancel(e.ctx)
@@ -664,6 +692,7 @@ func (e *Engine) authorizeIssue(ctx context.Context, j *savedIssueJob) error {
 }
 func (e *Engine) workIssue(ctx context.Context, j savedIssueJob) {
 	defer e.wg.Done()
+	dispatchAfter := true
 	defer func() {
 		e.mu.Lock()
 		a := e.active["issue/"+j.ID]
@@ -672,12 +701,16 @@ func (e *Engine) workIssue(ctx context.Context, j savedIssueJob) {
 		}
 		delete(e.active, "issue/"+j.ID)
 		delete(e.issueActive, j.ID)
+		if dispatchAfter {
+			e.dispatchIssueJobsLocked(githubKey(j.ProjectID, j.RepositoryID), j.ID)
+		}
 		e.mu.Unlock()
 		e.notify()
 	}()
 	release, err := acquireIssueLease(j.Repository.Path, j.ID)
 	if err != nil {
-		j.Error = err.Error()
+		dispatchAfter = false
+		j.Error = fmt.Sprintf("%s cannot acquire the repository writer: %v", managedWorkTitle("Issue", j.Number, j.Title), err)
 		_ = e.saveIssueJob(j)
 		return
 	}
